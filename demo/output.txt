@@ -1,0 +1,5 @@
+well 65 -> F5 (row-major), A9 (column-major)
+straight joint-space move blocked by obstacles for 10 of 10 wells
+trials: 100, success: 100 (100.0%)
+plan time: mean 70.6 ms, max 278.4 ms
+joint path length: raw 2.44 rad -> shortcut 2.08 rad
