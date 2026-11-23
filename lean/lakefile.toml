@@ -1,0 +1,6 @@
+name = "labhandslean"
+version = "0.1.0"
+defaultTargets = ["LabHandsLean"]
+
+[[lean_lib]]
+name = "LabHandsLean"
