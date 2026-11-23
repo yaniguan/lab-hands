@@ -109,6 +109,35 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 | 2026-06-11 | [Pipette: An Embodied Simulation Platform, Benchmark, and Data-Efficient Augmentation Framework for Wet-Lab Robotics](https://arxiv.org/abs/2606.12936) | Pipette: a simulation platform, benchmark and data augmentation pipeline for wet-lab robot learning. |
 | 2025-07-20 | [Touch in the Wild: Learning Fine-Grained Manipulation with a Portable Visuo-Tactile Gripper](https://arxiv.org/abs/2507.15062) | Touch in the Wild: a portable visuo-tactile gripper for collecting fine manipulation demos. |
 
+## System Profile: Object · Data · Model · Training · History · Unique Properties
+
+`lab-hands` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L1 · Protocol Compiler & Visuo-Tactile Manipulation`**.
+
+- **Object**: Physical manipulation and contact-sensing layer moving pipettes, tubes, and microplates safely around benchtop obstacles, while framing visuo-tactile control for transparent glass and plastic vessels.
+- **Data**: Synthetic ANSI/SLAS (SBS) 96-well plate geometry (`9 mm` pitch, row-major and column-major indexing) with tube-rack and reagent-bottle AABB obstacles (`10` wells x `10` seeds), plus 9 curated robot, transparent-object, and tactile datasets.
+- **Model**: Analytical 2-link planar kinematics (`fk`, `ik` with elbow-branch fallback), discrete 30-point link-AABB collision checking, joint-space RRT (`iters=3000`, `step=0.15 rad`, `goal_bias=0.1`), and 100-iteration randomized shortcut smoothing.
+- **Training**: Classical sampling-based planner (zero learned weights yet): resolves `10/10` obstacle-blocked straight moves with `100/100` (`100.0%`) RRT trial success in `70.6 ms` mean CPU time, shortening paths from `2.44 rad` to `2.08 rad` (`-14.8%`).
+- **History**: `eb4d967` (2026-11-18, `main` 2D SBS 96-well RRT + shortcut planner, reference benchmark, CI workflow, and visuo-tactile literature map).
+- **Unique Properties**: Pure-`numpy` single-file reproducibility with zero simulator/GPU dependencies, explicit dual-order SBS 96-well addressing (`65 -> F5` row-major vs `A9` column-major), and direct `L1` pairing with [`stepbot`](https://github.com/yaniguan/stepbot).
+
+Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
+
+## Repository Layout
+
+```text
+lab-hands/
+├── .github/workflows/
+│   └── demo.yml                  # CI workflow running the 100-trial RRT well-planning benchmark
+├── demo/
+│   ├── plan_to_well.py           # 2-link IK, AABB collision checker, RRT, and shortcut smoother
+│   └── output.txt                # Reference 100-trial CPU metrics
+├── docs/
+│   └── ARCHITECTURE_AND_HISTORY.md
+├── LICENSE                       # MIT License
+├── README.md                     # Overview, planner demo, and curated manipulation/tactile resources
+└── requirements.txt              # numpy only
+```
+
 ## Contributing
 
 Found a broken link or a missing dataset, repo or paper? Open an issue or a pull request.
