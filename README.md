@@ -8,23 +8,27 @@ In the lab agent on [yaniguan.github.io](https://yaniguan.github.io/), the hands
 
 ## First attempt
 
-A top-down 2D toy: a planar 2-link arm holds a pipette tip, starts at a tube and must reach a named well of an SBS 96-well plate (9 mm pitch) without hitting a reagent bottle or a rack wall. It maps well index to name (row-major and column-major), solves inverse kinematics, plans in joint space with RRT and then shortcuts the path. 10 target wells x 10 seeds. Pure numpy on CPU.
+A benchtop manipulation baseline (`lab_hands/`): a planar 2-link arm holds a pipette tip, starts at a reagent tube, and reaches named wells on standard ANSI/SLAS labware (6..384-well footprints aligned with `stepbot`'s 24-labware catalog) without clipping a reagent bottle or rack wall (`>= 5 mm` continuous segment-AABB clearance and joint limits). It solves both elbow IK branches, plans in joint space with forward `rrt` or bidirectional `rrt_connect`, shortcuts and C2-time-parameterizes paths under liquid-slosh acceleration bounds, verifies 2.5D safe-retract Z clearances, and exports `lab-hands/trajectory/v1` JSONL artifacts. `demo/tactile_insert.py` adds closed-loop compliant tactile bevel insertion resolving `+-3 mm` transparent-vessel visual error to `< 0.1 mm`. Pure numpy on CPU.
 
 ```bash
 python demo/plan_to_well.py
+python demo/plan_to_well.py --planner rrt_connect --out-jsonl runs/trajectories.jsonl
+python demo/tactile_insert.py
+python -m pytest -q
 ```
 
-Output (Linux, CPU only, 2026-11-18):
+Output (CPU only, re-measured with continuous 5 mm safety margin):
 
 ```
 well 65 -> F5 (row-major), A9 (column-major)
 straight joint-space move blocked by obstacles for 10 of 10 wells
 trials: 100, success: 100 (100.0%)
-plan time: mean 70.6 ms, max 278.4 ms
-joint path length: raw 2.44 rad -> shortcut 2.08 rad
+plan time (rrt): mean 63.7 ms, max 112.8 ms
+joint path length: raw 2.56 rad -> shortcut mean 2.16 rad (p95 2.47 rad, max 5.14 rad)
+minimum link-obstacle clearance: min 5.0 mm, mean 6.6 mm
 ```
 
-The straight joint move is blocked for every target, and RRT finds a path in all 100 trials. This is geometry only: no dynamics, no liquid, no camera. Next: the same task in a 3D simulator with a real arm model, then a learned policy (ACT or Diffusion Policy) from demonstrations.
+With `--planner rrt_connect`, mean plan + shortcut time drops to `29.0 ms` (`max 88.1 ms`, `p95 2.29 rad`, `max 2.74 rad` with zero homotopy flips). In `demo/tactile_insert.py`, closed-loop 2D contact shear compliance reaches `100/100` (`100.0%`) insertion success (`mean 0.085 mm`, `max 0.093 mm` centering error vs. `0/100` for open-loop camera plunge). Next: porting to a 3D physics simulator with a multi-DoF URDF arm, then learning visuomotor/tactile policies (ACT or Diffusion Policy) from demonstrations.
 
 ## Datasets
 
@@ -113,12 +117,12 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 
 `lab-hands` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L1 · Protocol Compiler & Visuo-Tactile Manipulation`**.
 
-- **Object**: Physical manipulation and contact-sensing layer moving pipettes, tubes, and microplates safely around benchtop obstacles, while framing visuo-tactile control for transparent glass and plastic vessels.
-- **Data**: Synthetic ANSI/SLAS (SBS) 96-well plate geometry (`9 mm` pitch, row-major and column-major indexing) with tube-rack and reagent-bottle AABB obstacles (`10` wells x `10` seeds), plus 9 curated robot, transparent-object, and tactile datasets.
-- **Model**: Analytical 2-link planar kinematics (`fk`, `ik` with elbow-branch fallback), discrete 30-point link-AABB collision checking, joint-space RRT (`iters=3000`, `step=0.15 rad`, `goal_bias=0.1`), and 100-iteration randomized shortcut smoothing.
-- **Training**: Classical sampling-based planner (zero learned weights yet): resolves `10/10` obstacle-blocked straight moves with `100/100` (`100.0%`) RRT trial success in `70.6 ms` mean CPU time, shortening paths from `2.44 rad` to `2.08 rad` (`-14.8%`).
-- **History**: `eb4d967` (2026-11-18, `main` 2D SBS 96-well RRT + shortcut planner, reference benchmark, CI workflow, and visuo-tactile literature map).
-- **Unique Properties**: Pure-`numpy` single-file reproducibility with zero simulator/GPU dependencies, explicit dual-order SBS 96-well addressing (`65 -> F5` row-major vs `A9` column-major), and direct `L1` pairing with [`stepbot`](https://github.com/yaniguan/stepbot).
+- **Object**: Physical manipulation and contact-sensing layer moving pipettes, tubes, and microplates safely around benchtop obstacles (`lab_hands/`), paired with closed-loop compliant tactile insertion for transparent glass and plastic vessels (`demo/tactile_insert.py`).
+- **Data**: Parameterized ANSI/SLAS labware footprints (`PlateGeometry` + 24-entry `STEPBOT_LABWARE_CATALOG` covering `6`..`384`-well plates, reservoirs, Falcon racks, and tipracks), AABB + 2.5D vessel-rim `BenchScene`, `lab-hands/trajectory/v1` JSONL artifacts, and 9 curated robot, transparent-object, and tactile datasets.
+- **Model**: Analytical 2-link kinematics (`Arm2D` with `[-pi, pi)` wrapping and `|q2| <= 2.6 rad` self-collision limits), exact continuous vectorized 2D segment-vs-AABB Euclidean distance & Jacobian-Lipschitz `edge_free`, 2.5D safe-retract Z clearance (`plan_transfer_3d`), forward `rrt` + bidirectional `rrt_connect`, C2 minimum-jerk droplet-slosh time parameterization (`parameterize_path`), and Jacobian-transpose 2D shear tactile servoing (`run_tactile_insertion`).
+- **Training**: Classical sampling-based & compliant control baselines: `100/100` (`100.0%`) obstacle-blocked planning success (`29.0 ms` mean with `rrt_connect`, `>= 5.0 mm` verified obstacle clearance) and `100/100` (`100.0%`) tactile insertion resolving `+-3 mm` visual error to `< 0.10 mm`.
+- **History**: `eb4d967` (2026-11-18, `main` 2D SBS 96-well RRT + shortcut demo & curated visuo-tactile map) -> modular `lab_hands/` package adding exact continuous collision checking, `rrt_connect`, 2.5D Z-safety, slosh-bounded trajectories, tactile insertion, 24-labware `stepbot` catalog, JSONL export, and cross-OS CI pytest suite.
+- **Unique Properties**: Pure-`numpy` CPU reproducibility across Linux/Windows/macOS, exact continuous segment-box clearance (`0` corner-tunneling gap), dual-order SBS well addressing (`65 -> F5` row-major vs `A9` column-major), and direct `L1`/`L4` integration with [`stepbot`](https://github.com/yaniguan/stepbot), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), and [`lab-verify`](https://github.com/yaniguan/lab-verify).
 
 Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
 
@@ -127,15 +131,27 @@ Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITEC
 ```text
 lab-hands/
 ├── .github/workflows/
-│   └── demo.yml                  # CI workflow running the 100-trial RRT well-planning benchmark
+│   └── demo.yml                  # Cross-OS (Linux/Windows/macOS) pytest + benchmark CI
 ├── demo/
-│   ├── plan_to_well.py           # 2-link IK, AABB collision checker, RRT, and shortcut smoother
+│   ├── plan_to_well.py           # CLI benchmark (rrt / rrt_connect, JSONL export, clearance gates)
+│   ├── tactile_insert.py         # Closed-loop compliant tactile bevel insertion demo
 │   └── output.txt                # Reference 100-trial CPU metrics
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md
+├── lab_hands/
+│   ├── __init__.py               # Public package exports
+│   ├── collision.py              # Exact segment-AABB clearance, vectorized edge_free & 2.5D Z safety
+│   ├── kinematics.py             # Arm2D FK/IK, boundary clamping, wrapping & joint limits
+│   ├── labware.py                # PlateGeometry, DeckLayout & 24-entry stepbot labware catalog
+│   ├── planner.py                # Multi-branch RRT, bidirectional RRT-Connect & shortcutting
+│   ├── tactile.py                # Simulated 2D contact shear & compliant bevel insertion controller
+│   └── trajectory.py             # C2 slosh-safe time parameterization & lab-hands/trajectory/v1 JSONL
+├── tests/
+│   └── test_plan_to_well.py      # Pytest suite covering kinematics, collision, planning & tactile
 ├── LICENSE                       # MIT License
-├── README.md                     # Overview, planner demo, and curated manipulation/tactile resources
-└── requirements.txt              # numpy only
+├── pyproject.toml                # Pytest configuration
+├── README.md                     # Overview, demos, and curated manipulation/tactile resources
+└── requirements.txt              # numpy>=1.26, pytest>=8
 ```
 
 ## Contributing

@@ -5,11 +5,18 @@ on:
   pull_request:
 jobs:
   run:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      - run: python -m pytest -q
       - run: python demo/plan_to_well.py
+      - run: python demo/plan_to_well.py --planner rrt_connect
+      - run: python demo/tactile_insert.py
