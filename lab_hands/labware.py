@@ -116,6 +116,30 @@ class PlateGeometry:
             dtype=np.float64,
         )
 
+    def footprint_bounds(self, pad_m: float = 0.015) -> Tuple[float, float, float, float]:
+        """Return (xmin, xmax, ymin, ymax) bounding footprint of the labware in meters."""
+        eff_pad = max(float(pad_m), float(self.well_radius_m) + 0.005)
+        if self.custom_well_offsets is not None and len(self.custom_well_offsets) > 0:
+            xs = [self.origin_xy[0] + ox for ox, _ in self.custom_well_offsets.values()]
+            ys = [self.origin_xy[1] + oy for _, oy in self.custom_well_offsets.values()]
+            return (min(xs) - eff_pad, max(xs) + eff_pad, min(ys) - eff_pad, max(ys) + eff_pad)
+        ox, oy = self.origin_xy
+        px_min = ox - eff_pad
+        px_max = ox + (self.cols - 1) * self.pitch_x + eff_pad
+        py_min = oy - (self.rows - 1) * self.pitch_y - eff_pad
+        py_max = oy + eff_pad
+        return (px_min, px_max, py_min, py_max)
+
+    def default_tip_length_m(self) -> float:
+        """Nominal disposable pipette tip length (m) when picking up from a tiprack."""
+        if not self.is_tiprack:
+            return 0.0
+        if self.max_volume_ul >= 1000.0:
+            return 0.095
+        if self.max_volume_ul >= 200.0:
+            return 0.058
+        return 0.046
+
     def with_origin(self, origin_xy: Tuple[float, float]) -> "PlateGeometry":
         return PlateGeometry(
             rows=self.rows,
@@ -257,7 +281,14 @@ class DeckLayout:
         self.labware_by_alias[alias] = geom
         return geom
 
-    def well_xy(self, ref: str) -> np.ndarray:
+    @property
+    def max_rim_m(self) -> float:
+        if not self.labware_by_alias:
+            return 0.0
+        return max(float(g.z_rim_m) for g in self.labware_by_alias.values())
+
+    def resolve_well(self, ref: str) -> Tuple[PlateGeometry, str, np.ndarray]:
+        """Resolve 'alias:well' or unambiguous bare 'well' to (PlateGeometry, well_name, xy_m)."""
         alias, well = parse_well_ref(ref)
         if alias is None:
             if len(self.labware_by_alias) != 1:
@@ -267,4 +298,8 @@ class DeckLayout:
             if alias not in self.labware_by_alias:
                 raise KeyError(f"Unknown deck labware alias {alias!r}")
             geom = self.labware_by_alias[alias]
-        return geom.well_xy(well)
+        return geom, well, geom.well_xy(well)
+
+    def well_xy(self, ref: str) -> np.ndarray:
+        _, _, xy = self.resolve_well(ref)
+        return xy

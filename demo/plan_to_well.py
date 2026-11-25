@@ -32,8 +32,10 @@ from lab_hands.labware import PlateGeometry  # noqa: E402
 from lab_hands.planner import (  # noqa: E402
     ik_solutions,
     path_length as length,
+    plan_well_tour,
     rrt as _rrt,
     rrt_connect as _rrt_connect,
+    select_ik_branch,
     shortcut as _shortcut,
 )
 from lab_hands.trajectory import TrajectoryRecord, build_trajectory_record  # noqa: E402

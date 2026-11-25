@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from community_extensions.slosh_minimum_jerk import (
+    DEFAULT_CORNER_OFFSETS_XY,
     OpenWellPlateSpec,
     SloshTrajectoryResult,
     compute_fundamental_slosh_omega,
@@ -13,6 +14,7 @@ from community_extensions.slosh_minimum_jerk import (
 )
 
 __all__ = [
+    "DEFAULT_CORNER_OFFSETS_XY",
     "OpenWellPlateSpec",
     "SloshTrajectoryResult",
     "compute_fundamental_slosh_omega",

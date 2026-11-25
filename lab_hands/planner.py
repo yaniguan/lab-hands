@@ -1,30 +1,67 @@
-"""Sampling-based joint-space motion planners (RRT, RRT-Connect) and shortcut smoothing."""
+"""Sampling-based joint-space motion planners (RRT, RRT-Connect), IK branch continuity, and tour DP."""
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from .collision import DEFAULT_SCENE, BenchScene, edge_free, in_collision
 from .kinematics import DEFAULT_ARM, Arm2D
+from .labware import DeckLayout, PlateGeometry
 
 GoalInput = Union[np.ndarray, Sequence[float], Sequence[np.ndarray]]
+WellRefInput = Union[str, Sequence[float], np.ndarray]
 
 
 def ik_solutions(
     p: Sequence[float] | np.ndarray,
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
+    *,
+    prev_q: Optional[Sequence[float] | np.ndarray] = None,
 ) -> List[np.ndarray]:
-    """Return all collision-free, joint-limit-valid IK configurations for target `p`."""
+    """Return all collision-free, joint-limit-valid IK configurations for target `p`.
+
+    When `prev_q` is provided, valid branches are ordered by joint-space proximity to `prev_q`
+    so sequential moves preserve elbow continuity whenever possible.
+    """
     out: List[np.ndarray] = []
     for elbow in (1, -1):
         q = arm.ik(p, elbow=elbow)
         if q is not None and not in_collision(q, arm=arm, scene=scene):
             if not any(np.allclose(q, prev, atol=1e-9) for prev in out):
                 out.append(q)
+    if prev_q is not None and len(out) > 1:
+        q_ref = np.asarray(prev_q, dtype=np.float64)
+        if q_ref.shape == (2,) and np.isfinite(q_ref).all():
+            out.sort(key=lambda q: float(np.linalg.norm(q - q_ref)))
     return out
+
+
+def select_ik_branch(
+    p: Sequence[float] | np.ndarray,
+    prev_q: Optional[Sequence[float] | np.ndarray] = None,
+    *,
+    arm: Arm2D = DEFAULT_ARM,
+    scene: BenchScene = DEFAULT_SCENE,
+    prefer_elbow: int = 1,
+) -> Optional[np.ndarray]:
+    """Select a collision-free IK branch minimizing joint displacement from `prev_q`."""
+    if prefer_elbow not in (1, -1):
+        raise ValueError(f"prefer_elbow must be +1 or -1, got {prefer_elbow!r}")
+    sols = ik_solutions(p, arm=arm, scene=scene, prev_q=prev_q)
+    if not sols:
+        return None
+    if prev_q is not None:
+        return sols[0].copy()
+    for q in sols:
+        branch = 1 if q[1] >= 0.0 else -1
+        if branch == prefer_elbow:
+            return q.copy()
+    return sols[0].copy()
 
 
 def _normalize_goals(
@@ -85,7 +122,7 @@ def rrt(
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
 ) -> Optional[List[np.ndarray]]:
-    """Forward joint-space RRT supporting single or multi-branch IK goals."""
+    """Forward joint-space RRT prioritizing same-elbow goal continuity before cross-branch fallback."""
     if start is None:
         return None
     q_start = np.asarray(start, dtype=np.float64)
@@ -99,18 +136,21 @@ def rrt(
     if direct is not None:
         return direct
 
+    goals_sorted = sorted(goals, key=lambda g: float(np.linalg.norm(g - q_start)))
+    same_branch_warmup = min(400, max(1, iters // 4))
+
     nodes: List[np.ndarray] = [q_start.copy()]
     parent: List[int] = [-1]
     arr = np.zeros((iters + 2, 2), dtype=np.float64)
     arr[0] = q_start
 
-    for _ in range(iters):
+    for it in range(iters):
+        active_goals = goals_sorted[:1] if (len(goals_sorted) > 1 and it < same_branch_warmup) else goals_sorted
         if rng.random() < goal_bias:
-            # Prefer nearest valid IK branch most of the time while still exploring all branches
-            if len(goals) > 1 and rng.random() < 0.8:
-                x = min(goals, key=lambda g: float(np.linalg.norm(g - q_start)))
+            if len(active_goals) > 1 and rng.random() < 0.8:
+                x = active_goals[0]
             else:
-                x = goals[int(rng.integers(0, len(goals)))]
+                x = active_goals[int(rng.integers(0, len(active_goals)))]
         else:
             x = arm.sample_configuration(rng)
 
@@ -135,7 +175,7 @@ def rrt(
         parent.append(i)
         new_idx = len(nodes) - 1
 
-        for g in sorted(goals, key=lambda q: float(np.linalg.norm(q - new))):
+        for g in sorted(active_goals, key=lambda q: float(np.linalg.norm(q - new))):
             dist_g = float(np.linalg.norm(new - g))
             if dist_g <= 1e-9:
                 nodes[new_idx] = g.copy()
@@ -229,7 +269,7 @@ def rrt_connect(
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
 ) -> Optional[List[np.ndarray]]:
-    """Bidirectional RRT-Connect growing alternating trees from start and all valid IK goals."""
+    """Bidirectional RRT-Connect growing alternating trees from start and valid IK goals."""
     if start is None:
         return None
     q_start = np.asarray(start, dtype=np.float64)
@@ -320,3 +360,174 @@ def shortcut(
 
 def path_length(path: Sequence[np.ndarray]) -> float:
     return float(sum(np.linalg.norm(np.asarray(b) - np.asarray(a)) for a, b in zip(path, path[1:])))
+
+
+@dataclass(frozen=True)
+class WellTourResult:
+    """Multi-well tour optimized via Viterbi dynamic programming over IK elbow branches."""
+
+    wells: Tuple[str, ...]
+    goal_configs: List[np.ndarray]
+    elbow_branches: Tuple[int, ...]
+    legs: List[List[np.ndarray]]
+    waypoints: List[np.ndarray]
+    total_path_length_rad: float
+    elbow_flips: int
+
+
+def _resolve_tour_point(
+    item: WellRefInput,
+    idx: int,
+    *,
+    plate: Optional[PlateGeometry],
+    deck: Optional[DeckLayout],
+    scene: BenchScene,
+) -> Tuple[str, np.ndarray]:
+    if isinstance(item, str):
+        s = item.strip()
+        if s.upper() == "TUBE":
+            return "TUBE", np.asarray(scene.tube_xy, dtype=np.float64)
+        if deck is not None:
+            return s, deck.well_xy(s)
+        if plate is not None:
+            return s, plate.well_xy(s)
+        if scene.deck is not None and ":" in s:
+            return s, scene.deck.well_xy(s)
+        return s, scene.plate.well_xy(s)
+    arr = np.asarray(item, dtype=np.float64)
+    if arr.shape != (2,):
+        raise ValueError(f"Tour target[{idx}] must be a well name or 2D coordinate, got {item!r}")
+    return f"pt_{idx}", arr
+
+
+def _tour_transition_cost(
+    qa: np.ndarray,
+    qb: np.ndarray,
+    arm: Arm2D,
+    scene: BenchScene,
+) -> float:
+    dist = float(np.linalg.norm(qb - qa))
+    flip_penalty = math.pi if (qa[1] >= 0.0) != (qb[1] >= 0.0) else 0.0
+    obs_penalty = 0.0 if edge_free(qa, qb, arm=arm, scene=scene) else 1.5
+    return dist + flip_penalty + obs_penalty
+
+
+def plan_well_tour(
+    wells: Sequence[WellRefInput],
+    rng: Optional[np.random.Generator] = None,
+    *,
+    start_q: Optional[Sequence[float] | np.ndarray] = None,
+    plate: Optional[PlateGeometry] = None,
+    deck: Optional[DeckLayout] = None,
+    arm: Arm2D = DEFAULT_ARM,
+    scene: BenchScene = DEFAULT_SCENE,
+    planner: str = "rrt_connect",
+) -> Optional[WellTourResult]:
+    """Plan a continuous multi-well tour using Viterbi DP over valid IK branches to avoid elbow flips."""
+    if not wells:
+        raise ValueError("wells must be non-empty")
+    eff_rng = np.random.default_rng(0) if rng is None else rng
+
+    q_init: Optional[np.ndarray] = None
+    if start_q is not None:
+        q_init = np.asarray(start_q, dtype=np.float64)
+        if q_init.shape != (2,) or in_collision(q_init, arm=arm, scene=scene):
+            return None
+
+    labels: List[str] = []
+    candidates: List[List[np.ndarray]] = []
+    for idx, w in enumerate(wells):
+        label, xy = _resolve_tour_point(w, idx, plate=plate, deck=deck, scene=scene)
+        sols = ik_solutions(xy, arm=arm, scene=scene)
+        if not sols:
+            return None
+        labels.append(label)
+        candidates.append(sols)
+
+    m = len(candidates)
+    dp: List[List[float]] = []
+    backptr: List[List[int]] = []
+
+    first_costs: List[float] = []
+    for q0 in candidates[0]:
+        if q_init is not None:
+            first_costs.append(_tour_transition_cost(q_init, q0, arm, scene))
+        else:
+            # Tiny deterministic tie-breaker preferring elbow=+1 only when total tour costs match
+            first_costs.append(0.0 if q0[1] >= 0.0 else 1e-6)
+    dp.append(first_costs)
+    backptr.append([-1] * len(candidates[0]))
+
+    for t in range(1, m):
+        cur_costs: List[float] = []
+        cur_back: List[int] = []
+        for q_cur in candidates[t]:
+            best_c = math.inf
+            best_prev = 0
+            for prev_idx, q_prev in enumerate(candidates[t - 1]):
+                c = dp[t - 1][prev_idx] + _tour_transition_cost(q_prev, q_cur, arm, scene)
+                if c < best_c:
+                    best_c = c
+                    best_prev = prev_idx
+            cur_costs.append(best_c)
+            cur_back.append(best_prev)
+        dp.append(cur_costs)
+        backptr.append(cur_back)
+
+    best_last = int(np.argmin(dp[-1]))
+    chosen_indices = [0] * m
+    chosen_indices[-1] = best_last
+    for t in range(m - 1, 0, -1):
+        chosen_indices[t - 1] = backptr[t][chosen_indices[t]]
+
+    goal_configs = [candidates[t][chosen_indices[t]].copy() for t in range(m)]
+    elbow_branches = tuple(1 if q[1] >= 0.0 else -1 for q in goal_configs)
+    flips = sum(1 for a, b in zip(elbow_branches, elbow_branches[1:]) if a != b)
+
+    solve_primary = rrt_connect if planner == "rrt_connect" else rrt
+    solve_backup = rrt if planner == "rrt_connect" else rrt_connect
+
+    node_seq: List[np.ndarray] = ([q_init.copy()] if q_init is not None else []) + goal_configs
+    legs: List[List[np.ndarray]] = []
+    if len(node_seq) == 1:
+        waypoints = [node_seq[0].copy()]
+        return WellTourResult(
+            wells=tuple(labels),
+            goal_configs=goal_configs,
+            elbow_branches=elbow_branches,
+            legs=[],
+            waypoints=waypoints,
+            total_path_length_rad=0.0,
+            elbow_flips=0,
+        )
+
+    for qa, qb in zip(node_seq, node_seq[1:]):
+        if np.allclose(qa, qb, atol=1e-9):
+            legs.append([qa.copy(), qb.copy()])
+        elif edge_free(qa, qb, arm=arm, scene=scene):
+            legs.append([qa.copy(), qb.copy()])
+        else:
+            raw = solve_primary(qa, [qb], eff_rng, arm=arm, scene=scene)
+            if raw is None:
+                raw = solve_backup(qa, [qb], eff_rng, arm=arm, scene=scene)
+            if raw is None:
+                return None
+            sp = shortcut(raw, eff_rng, arm=arm, scene=scene)
+            sp[0] = qa.copy()
+            sp[-1] = qb.copy()
+            legs.append(sp)
+
+    waypoints: List[np.ndarray] = [legs[0][0].copy()]
+    for leg in legs:
+        for pt in leg[1:]:
+            waypoints.append(pt.copy())
+
+    return WellTourResult(
+        wells=tuple(labels),
+        goal_configs=goal_configs,
+        elbow_branches=elbow_branches,
+        legs=legs,
+        waypoints=waypoints,
+        total_path_length_rad=path_length(waypoints),
+        elbow_flips=flips,
+    )

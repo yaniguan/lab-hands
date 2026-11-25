@@ -119,12 +119,20 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 
 - **Object**: Physical manipulation and contact-sensing layer moving pipettes, tubes, and microplates safely around benchtop obstacles (`lab_hands/`), paired with closed-loop compliant tactile insertion for transparent glass and plastic vessels (`demo/tactile_insert.py`).
 - **Data**: Parameterized ANSI/SLAS labware footprints (`PlateGeometry` + 24-entry `STEPBOT_LABWARE_CATALOG` covering `6`..`384`-well plates, reservoirs, Falcon racks, and tipracks), AABB + 2.5D vessel-rim `BenchScene`, `lab-hands/trajectory/v1` JSONL artifacts, and 9 curated robot, transparent-object, and tactile datasets.
-- **Model**: Analytical 2-link kinematics (`Arm2D` with `[-pi, pi)` wrapping and `|q2| <= 2.6 rad` self-collision limits), exact continuous vectorized 2D segment-vs-AABB Euclidean distance & Jacobian-Lipschitz `edge_free`, 2.5D safe-retract Z clearance (`plan_transfer_3d`), forward `rrt` + bidirectional `rrt_connect`, C2 minimum-jerk droplet-slosh time parameterization (`parameterize_path`), and Jacobian-transpose 2D shear tactile servoing (`run_tactile_insertion`).
-- **Training**: Classical sampling-based & compliant control baselines: `100/100` (`100.0%`) obstacle-blocked planning success (`29.0 ms` mean with `rrt_connect`, `>= 5.0 mm` verified obstacle clearance) and `100/100` (`100.0%`) tactile insertion resolving `+-3 mm` visual error to `< 0.10 mm`.
-- **History**: `eb4d967` (2026-11-18, `main` 2D SBS 96-well RRT + shortcut demo & curated visuo-tactile map) -> modular `lab_hands/` package adding exact continuous collision checking, `rrt_connect`, 2.5D Z-safety, slosh-bounded trajectories, tactile insertion, 24-labware `stepbot` catalog, JSONL export, and cross-OS CI pytest suite.
-- **Unique Properties**: Pure-`numpy` CPU reproducibility across Linux/Windows/macOS, exact continuous segment-box clearance (`0` corner-tunneling gap), dual-order SBS well addressing (`65 -> F5` row-major vs `A9` column-major), and direct `L1`/`L4` integration with [`stepbot`](https://github.com/yaniguan/stepbot), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), and [`lab-verify`](https://github.com/yaniguan/lab-verify).
+- **Model**: Analytical 2-link (`Arm2D`) and 6-DOF `SE(3)` spherical-wrist (`ArmSE3`, `PoseSE3`) kinematics, continuity-aware IK & Viterbi multi-well tour planning (`select_ik_branch`, `plan_well_tour`), exact continuous capsule-vs-AABB clearance (`segment_aabb_clearance`) & Jacobian-Lipschitz `edge_free`, per-labware Z-rim + attached-tip 3D safe transit (`plan_transfer_3d`, `plan_3d_pick_place`), analytical C2 corner-well slosh time parameterization (`parameterize_path`, `plan_slosh_bounded_min_jerk`), and Jacobian-transpose tactile servoing with slip/seal detection (`run_tactile_insertion`).
+- **Training**: Classical sampling-based & compliant control baselines: `100/100` (`100.0%`) obstacle-blocked planning success (`>= 5.0 mm` verified continuous obstacle clearance), `60/60` zero-spill corner-well open-plate transports (`< 0.70 * h_free`), and `100/100` (`100.0%`) tactile insertion resolving `+-3 mm` visual error to `< 0.10 mm`.
+- **History**: `eb4d967` (2026-11-18, `main` 2D SBS 96-well RRT + shortcut demo & curated visuo-tactile map) -> modular `lab_hands/` package adding exact continuous capsule-AABB clearance, Lean 4 Lipschitz swept-segment soundness, stateful IK & Viterbi tours, 6-DOF `SE(3)` per-labware Z-rim/tip planning, corner-well slosh scaling, tactile slip/seal telemetry, and `autolab-wire/v1` integration.
+- **Unique Properties**: Pure-`numpy` CPU reproducibility across Linux/Windows/macOS, exact continuous segment-box clearance (`0` corner-tunneling gap), dual-order SBS well addressing (`65 -> F5` row-major vs `A9` column-major), and direct `autolab-wire/v1` integration with [`lab-verify`](https://github.com/yaniguan/lab-verify), [`stepbot`](https://github.com/yaniguan/stepbot), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), [`lab-feet`](https://github.com/yaniguan/lab-feet), and [`lab-attrib`](https://github.com/yaniguan/lab-attrib).
 
 Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md).
+
+## 15-Repository Auto-Lab Wire Contract (autolab-wire/v1)
+
+`autolab_wire.py` (`REPO_ID = "lab-hands"`, `LAYER = "L1"`) exposes `process_packet(packet: dict) -> dict` for the 15-repository [Auto-Lab](https://github.com/yaniguan/auto-lab) wire bus (`autolab-wire/v1`):
+
+- **Wire Topology**: Upstream [`lab-verify`](https://github.com/yaniguan/lab-verify) (`L4` SQL & `lean-mcp/v1` gate, alongside `lab-rehearsal` and sibling `L1` [`stepbot`](https://github.com/yaniguan/stepbot)) -> **`lab-hands`** (`L1` continuity-aware 2-link IK, seeded RRT & shortcutting, certified continuous clearance, and tactile bevel insertion) -> downstream [`lab-feet`](https://github.com/yaniguan/lab-feet) (`L0` INT8 / 4-bit bench runtime) -> [`lab-attrib`](https://github.com/yaniguan/lab-attrib) (`L4` post-execution causal blame, NNLS XRD deconvolution & SHA-256 certified ledger).
+- **Packet Gate & Payload**: Reads `start_well` (default `"A1"`), `target_well` (default `"H12"`), `clearance_mm` (default `8.5`), optional `start_q`, and optional `visual_offset_mm`; enforces `LabHandsLean` `>= 5.0 mm` continuous clearance (`halt_reason = "L1_HANDS_COLLISION_OR_CLEARANCE_BLOCK"`) and tactile seal seating (`halt_reason = "L1_HANDS_TACTILE_INSERTION_OR_SEAL_BLOCK"`), emits `measured_min_clearance_mm`, `start_q`/`end_q`, and `tactile` slip/force telemetry in `out["manipulation"]`, and records `invariant = "arm_path_collision_free_with_5mm_margin"` in `bottom_reasoning_traces`.
+- **15-Repository Stack (`L0`-`L6`)**: `lab-ears` (`L2`) · `lab-ask-why`, `lab-decide` (`L6`) · `lab-automation-atlas`, `buy-or-make`, `labshift` (`L5`) · `lab-rehearsal`, `lab-verify`, `lab-attrib` (`L4`) · `stepbot`, `lab-hands` (`L1`) · `lab-feet` (`L0`) · `twinstep`, `labfill`, `labbench-posttrain` (`L3`).
 
 ## Repository Layout
 
@@ -132,6 +140,8 @@ Full technical specification: [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITEC
 lab-hands/
 ├── .github/workflows/
 │   └── demo.yml                  # Cross-OS (Linux/Windows/macOS) pytest + benchmark CI
+├── community_extensions/
+│   └── slosh_minimum_jerk.py     # Open-meniscus pendulum-slosh minimum-jerk time-scaler
 ├── demo/
 │   ├── plan_to_well.py           # CLI benchmark (rrt / rrt_connect, JSONL export, clearance gates)
 │   ├── tactile_insert.py         # Closed-loop compliant tactile bevel insertion demo
@@ -146,8 +156,13 @@ lab-hands/
 │   ├── planner.py                # Multi-branch RRT, bidirectional RRT-Connect & shortcutting
 │   ├── tactile.py                # Simulated 2D contact shear & compliant bevel insertion controller
 │   └── trajectory.py             # C2 slosh-safe time parameterization & lab-hands/trajectory/v1 JSONL
+├── lean/
+│   └── LabHandsLean.lean         # Lean 4 proofs for >= 5 mm clearance & open-meniscus slosh bounds
 ├── tests/
+│   ├── test_autolab_wire.py      # autolab-wire/v1 L1 packet & clearance-gate tests
+│   ├── test_community_extensions.py
 │   └── test_plan_to_well.py      # Pytest suite covering kinematics, collision, planning & tactile
+├── autolab_wire.py               # 15-repo Auto-Lab wire node (REPO_ID="lab-hands", LAYER="L1")
 ├── LICENSE                       # MIT License
 ├── pyproject.toml                # Pytest configuration
 ├── README.md                     # Overview, demos, and curated manipulation/tactile resources
