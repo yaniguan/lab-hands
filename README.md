@@ -32,19 +32,32 @@ With `--planner rrt_connect`, mean plan + shortcut time drops to `29.0 ms` (`max
 
 ## Datasets
 
-| Dataset | What | License |
-|---|---|---|
-| [Open X-Embodiment](https://robotics-transformer-x.github.io/) | Large multi-robot trajectory collection in one format | Mixed per sub-dataset - check each |
-| [LeRobot datasets](https://huggingface.co/lerobot) | Many robot datasets in one format (e.g. ALOHA sim) | Per dataset (e.g. aloha_sim_insertion_human: MIT) |
-| [AutoBio pipette task](https://huggingface.co/datasets/autobio-bench/pipette-mujoco) | Simulated lab pipetting demos | MIT |
-| [TransCG](https://graspnet.net/transcg) | Real depth data for transparent objects | CC BY-NC-SA 4.0 (**non-commercial**) |
-| [ClearGrasp](https://sites.google.com/view/cleargrasp) | Synthetic + real transparent object depth | See project site |
-| [Vector-LabPics](https://github.com/sagieppel/Detecting-and-segmenting-and-classifying-materials-inside-vessels-in-images-using-convolutional-net) | Lab images of vessels and materials (liquid, foam, solid) | Code MIT; data see source |
-| [Touch-Slide (DIGIT)](https://huggingface.co/datasets/facebook/touch-slide) | Tactile images for pretraining | CC BY-NC 4.0 (**non-commercial**) |
-| [Touch and Go](https://touch-and-go.github.io/) | Human-collected vision + touch | See project site |
-| [ObjectFolder](https://objectfolder.stanford.edu/) | Multisensory object data incl. tactile | See project site |
+Typed dataset registry (`lab_hands/datasets.py` + `scripts/fetch_open_datasets.py`, keeping downloaded metadata and episode shards gitignored under `data/open_datasets/`) with machine-checked SPDX licensing, `commercial_use_ok` guardrails, and `ArmSE3` / 96-well clearance & meniscus-slosh episode auditing:
 
-Licenses marked **non-commercial** are fine for research but not for products.
+| Dataset ID | Dataset | Modality | Venue / Year | SPDX License | Commercial OK | What |
+|---|---|---|---|---|---|---|
+| `finebio` | [FineBio](https://github.com/aistairc/FineBio) | `wetlab_video` | CVPR 2024 / IJCV 2025 | `LicenseRef-FineBio-NC` | **No** (**non-commercial**) | Multi-view (egocentric + 5 benchtop views) PCR & micropipetting videos with hierarchical step, atomic-operation, and manipulated/affected labware annotations |
+| `droid` | [DROID](https://droid-dataset.github.io/) | `kinematics` | RSS 2024 | `CC-BY-4.0` | Yes | 76k+ distributed 7-DoF Franka Panda teleoperated trajectories across 564 scenes ([`lerobot/droid_1.0.1`](https://huggingface.co/datasets/lerobot/droid_1.0.1)) |
+| `lerobot` | [LeRobot v3.0](https://huggingface.co/datasets/lerobot/aloha_mobile_cabinet) | `kinematics` | HuggingFace 2025 | `Apache-2.0` | Yes | Standardized 50 Hz Apache Parquet + AV1 robot imitation episodes (`observation.state`, `action`, `timestamp`) for ALOHA & SO-ARM100 |
+| `autobio_pipette_mujoco` | [AutoBio Pipette MuJoCo](https://huggingface.co/datasets/autobio-bench/pipette-mujoco) | `kinematics` | AutoBio-Bench 2025 | `MIT` | Yes | 100 simulated 50 Hz UR5e wet-lab micropipetting episodes (71,014 frames in LeRobot v2.1 Parquet schema) |
+| `transcg` | [TransCG](https://github.com/Galaxies99/TransCG) | `transparent_depth` | RA-L / ICRA 2023 | `CC-BY-NC-SA-4.0` | **No** (**non-commercial**) | 57k real RGB-D frames of 51 transparent containers with ground-truth depth completion & grasp labels |
+| `transproteus` | [TransProteus](https://github.com/sagieppel/TransProteus_Paper_Code) | `transparent_depth` | Digital Discovery 2024 | `CC-BY-4.0` | Yes | 50k+ annotated scenes of liquids, phase boundaries, and solids inside transparent chemical vessels with 3D XYZ & depth maps |
+| `clearpose` | [ClearPose](https://github.com/opipari/ClearPose) | `transparent_depth` | ECCV / 2024 | `CC-BY-4.0` | Yes | 350k+ labeled real RGB-D frames covering 63 transparent glassware & reagent vessels under liquid fills and heavy clutter |
+| `layered_depth` | [LayeredDepth](https://huggingface.co/datasets/princeton-vl/LayeredDepth) | `transparent_depth` | ICCV 2025 | `CC0-1.0` | Yes | Multi-layer depth benchmark resolving front-surface glass geometry alongside transmitted interior/background surfaces |
+| `tvl` | [TVL (Touch-Vision-Language)](https://huggingface.co/datasets/mlfu7/Touch-Vision-Language-Dataset) | `visuo_tactile` | ICML 2024 | `Apache-2.0` | Yes | 44k paired in-the-wild DIGIT optical tactile and RGB frames aligned with contact-property language annotations |
+| `tactx` | [TactX](https://huggingface.co/datasets/TactX/TactX) | `visuo_tactile` | TactX 2025 | `CC-BY-4.0` | Yes | 544 teleoperated Franka episodes across 3 tactile sensors (`Daimon`, `eFlesh`, `FlexiTac`) and 4 contact-rich insertion/manipulation tasks |
+| `feelsight` | [FeelSight / NeuralFeels](https://huggingface.co/datasets/suddhu/Feelsight) | `visuo_tactile` | Meta AI 2024 | `MIT` | Yes | 70 real & simulated DIGIT visuo-tactile + proprioception contact sequences for sub-millimeter pose tracking under occlusion |
+| `octopi_physiclear` | [Octopi & PhysiCLeAR](https://github.com/clear-nus/octopi-1.5) | `visuo_tactile` | RSS 2024 / RSS 2025 | `LicenseRef-Octopi-Research` | **No** (**non-commercial**) | GelSight tactile video suite with physical compliance, roughness, and hardness annotations for tactile-LLM reasoning |
+
+Additional foundational references: [Open X-Embodiment](https://robotics-transformer-x.github.io/) (mixed per sub-dataset), [ClearGrasp](https://sites.google.com/view/cleargrasp), [Vector-LabPics](https://github.com/sagieppel/Detecting-and-segmenting-and-classifying-materials-inside-vessels-in-images-using-convolutional-net), [Touch-Slide (DIGIT)](https://huggingface.co/datasets/facebook/touch-slide) (`CC-BY-NC-4.0`, **non-commercial**), [Touch and Go](https://touch-and-go.github.io/), and [ObjectFolder](https://objectfolder.stanford.edu/).
+
+```bash
+python scripts/fetch_open_datasets.py --list --commercial-only --min-year 2024
+python scripts/fetch_open_datasets.py --verify-urls
+python scripts/fetch_open_datasets.py --dataset autobio_pipette_mujoco --max-rows 64
+```
+
+Licenses marked **non-commercial** are fine for research but blocked automatically when `--commercial-only` or `check_commercial_compliance()` is active.
 
 ## Open-source repos
 
@@ -118,7 +131,7 @@ Recent results, newest first. Date = first arXiv version; each line is a short s
 `lab-hands` is part of the [Robot AI Auto-Lab (`auto-lab`)](https://github.com/yaniguan/auto-lab) ecosystem ([Project Studio](https://yaniguan.github.io/auto-lab/)) at **Layer `L1 · Protocol Compiler & Visuo-Tactile Manipulation`**.
 
 - **Object**: Physical manipulation and contact-sensing layer moving pipettes, tubes, and microplates safely around benchtop obstacles (`lab_hands/`), paired with closed-loop compliant tactile insertion for transparent glass and plastic vessels (`demo/tactile_insert.py`).
-- **Data**: Parameterized ANSI/SLAS labware footprints (`PlateGeometry` + 24-entry `STEPBOT_LABWARE_CATALOG` covering `6`..`384`-well plates, reservoirs, Falcon racks, and tipracks), AABB + 2.5D vessel-rim `BenchScene`, `lab-hands/trajectory/v1` JSONL artifacts, and 9 curated robot, transparent-object, and tactile datasets.
+- **Data**: Parameterized ANSI/SLAS labware footprints (`PlateGeometry` + 24-entry `STEPBOT_LABWARE_CATALOG` covering `6`..`384`-well plates, reservoirs, Falcon racks, and tipracks), AABB + 2.5D vessel-rim `BenchScene`, `lab-hands/trajectory/v1` JSONL artifacts, and a 12-entry typed `OPEN_MANIPULATION_DATASETS` registry (`lab_hands/datasets.py`) spanning `kinematics`, `transparent_depth`, `visuo_tactile`, and `wetlab_video` with LeRobot Parquet/JSONL and FineBio 3D benchtop episode loaders.
 - **Model**: Analytical 2-link (`Arm2D`) and 6-DOF `SE(3)` spherical-wrist (`ArmSE3`, `PoseSE3`) kinematics, continuity-aware IK & Viterbi multi-well tour planning (`select_ik_branch`, `plan_well_tour`), exact continuous capsule-vs-AABB clearance (`segment_aabb_clearance`) & Jacobian-Lipschitz `edge_free`, per-labware Z-rim + attached-tip 3D safe transit (`plan_transfer_3d`, `plan_3d_pick_place`), analytical C2 corner-well slosh time parameterization (`parameterize_path`, `plan_slosh_bounded_min_jerk`), and Jacobian-transpose tactile servoing with slip/seal detection (`run_tactile_insertion`).
 - **Training**: Classical sampling-based & compliant control baselines: `100/100` (`100.0%`) obstacle-blocked planning success (`>= 5.0 mm` verified continuous obstacle clearance), `60/60` zero-spill corner-well open-plate transports (`< 0.70 * h_free`), and `100/100` (`100.0%`) tactile insertion resolving `+-3 mm` visual error to `< 0.10 mm`.
 - **History**: `eb4d967` (2026-11-18, `main` 2D SBS 96-well RRT + shortcut demo & curated visuo-tactile map) -> modular `lab_hands/` package adding exact continuous capsule-AABB clearance, Lean 4 Lipschitz swept-segment soundness, stateful IK & Viterbi tours, 6-DOF `SE(3)` per-labware Z-rim/tip planning, corner-well slosh scaling, tactile slip/seal telemetry, and `autolab-wire/v1` integration.
@@ -151,16 +164,21 @@ lab-hands/
 ├── lab_hands/
 │   ├── __init__.py               # Public package exports
 │   ├── collision.py              # Exact segment-AABB clearance, vectorized edge_free & 2.5D Z safety
-│   ├── kinematics.py             # Arm2D FK/IK, boundary clamping, wrapping & joint limits
+│   ├── datasets.py               # OpenManipulationDataset registry, LeRobot/FineBio loaders & SE(3)/slosh audits
+│   ├── kinematics.py             # Arm2D/ArmSE3 FK/IK, boundary clamping, wrapping & joint limits
 │   ├── labware.py                # PlateGeometry, DeckLayout & 24-entry stepbot labware catalog
 │   ├── planner.py                # Multi-branch RRT, bidirectional RRT-Connect & shortcutting
 │   ├── tactile.py                # Simulated 2D contact shear & compliant bevel insertion controller
 │   └── trajectory.py             # C2 slosh-safe time parameterization & lab-hands/trajectory/v1 JSONL
 ├── lean/
 │   └── LabHandsLean.lean         # Lean 4 proofs for >= 5 mm clearance & open-meniscus slosh bounds
+├── scripts/
+│   └── fetch_open_datasets.py    # CLI for dataset listing, SPDX commercial checks, live URL checks & sample pulls
 ├── tests/
 │   ├── test_autolab_wire.py      # autolab-wire/v1 L1 packet & clearance-gate tests
 │   ├── test_community_extensions.py
+│   ├── test_open_datasets_2026.py# Open dataset registry, non-commercial flags & SE(3)/slosh audit tests
+│   ├── test_phase2_audit_fixes.py
 │   └── test_plan_to_well.py      # Pytest suite covering kinematics, collision, planning & tactile
 ├── autolab_wire.py               # 15-repo Auto-Lab wire node (REPO_ID="lab-hands", LAYER="L1")
 ├── LICENSE                       # MIT License

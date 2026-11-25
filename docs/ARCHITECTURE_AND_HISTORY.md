@@ -40,9 +40,16 @@ All geometry is deterministic, self-contained, and anchored to ANSI/SLAS (SBS) l
     1. Tube rack wall: `(0.33, -0.08, 0.36, 0.12)`.
     2. Reagent bottle: `(0.15, 0.27, 0.24, 0.34)`.
 
-### 2.2 Curated External Datasets & Licenses
+### 2.2 Typed Open Manipulation, Transparent-Depth & Visuo-Tactile Dataset Registry (`lab_hands/datasets.py`)
 
-`README.md` organizes nine foundational datasets across robot manipulation (Open X-Embodiment, LeRobot, AutoBio pipette MuJoCo), transparent vessels (TransCG, ClearGrasp, Vector-LabPics), and visuo-tactile sensing (Touch-Slide / DIGIT, Touch and Go, ObjectFolder), flagging non-commercial restrictions explicitly.
+`lab_hands/datasets.py` and `scripts/fetch_open_datasets.py` (storing on-demand metadata and sample shards strictly inside gitignored `data/open_datasets/`) maintain the 12-entry `OPEN_MANIPULATION_DATASETS` registry (`OpenManipulationDataset`) across four typed modalities:
+
+- **`wetlab_video`**: `finebio` (`LicenseRef-FineBio-NC`, `commercial_use_ok=False`, CVPR 2024 / IJCV 2025 multi-view wet-lab atomic manipulation & pipetting benchmark).
+- **`kinematics`**: `droid` (`CC-BY-4.0`, `commercial_use_ok=True`, RSS 2024), `lerobot` (`Apache-2.0`, `commercial_use_ok=True`, HuggingFace LeRobot v3.0 Parquet episodes), and `autobio_pipette_mujoco` (`MIT`, `commercial_use_ok=True`, 50 Hz UR5e wet-lab pipetting in LeRobot v2.1 Parquet schema).
+- **`transparent_depth`**: `transcg` (`CC-BY-NC-SA-4.0`, `commercial_use_ok=False`), `transproteus` (`CC-BY-4.0`, `commercial_use_ok=True`, 2024 liquid/solid 3D shapes inside transparent vessels), `clearpose` (`CC-BY-4.0`, `commercial_use_ok=True`), and `layered_depth` (`CC0-1.0`, `commercial_use_ok=True`, ICCV 2025 multi-layer glass depth).
+- **`visuo_tactile`**: `tvl` (`Apache-2.0`, `commercial_use_ok=True`, ICML 2024 Touch-Vision-Language), `tactx` (`CC-BY-4.0`, `commercial_use_ok=True`, 2025 cross-sensor tactile insertion & manipulation), `feelsight` (`MIT`, `commercial_use_ok=True`, Meta AI NeuralFeels), and `octopi_physiclear` (`LicenseRef-Octopi-Research`, `commercial_use_ok=False`, RSS 2024 / RSS 2025 GelSight property reasoning).
+
+`OpenManipulationDataset` enforces a fail-closed SPDX invariant rejecting `commercial_use_ok=True` on any `NC` or `LicenseRef-*` license, paired with `check_commercial_compliance()` and `--commercial-only` CLI gates. Episode and action loaders (`load_lerobot_episode`, `load_finebio_annotations`, `convert_finebio_to_se3_plans`) map LeRobot `.parquet` / `.jsonl` / HuggingFace `/rows` joint trajectories and FineBio 3D benchtop action transcripts directly into `audit_se3_trajectory`, `audit_lerobot_episode`, and `audit_finebio_annotations` to verify `ArmSE3` joint limits, `>= 5.0 mm` continuous obstacle clearance, 96-well rim & `< 1.5 deg` plunge verticality, and `< 0.70 * h_free` cylindrical meniscus slosh bounds.
 
 ---
 
@@ -86,7 +93,8 @@ All geometry is deterministic, self-contained, and anchored to ANSI/SLAS (SBS) l
 | Date (ISO-8601) | Commit / Ref | Summary of Changes |
 |---|---|---|
 | `2026-11-18` | `eb4d967` (`main`) | Initial 2D SBS 96-well RRT + shortcut demo & curated visuo-tactile resource map. |
-| `2026-11-24` | `lab_hands/` modularization & Phase-2 audit fixes | Added exact continuous `segment_aabb_clearance`, Lean 4 Lipschitz swept-segment proof (`LabHandsLean`), stateful IK & Viterbi `plan_well_tour`, corner-well rotational slosh scaling, 6-DOF `SE(3)` + per-labware Z-rim/tip `plan_3d_pick_place`, and `autolab-wire/v1` measured clearance & tactile telemetry. |
+| `2026-11-24` | `2ac55e2` (`main`) | Added exact continuous `segment_aabb_clearance`, Lean 4 Lipschitz swept-segment proof (`LabHandsLean`), stateful IK & Viterbi `plan_well_tour`, corner-well rotational slosh scaling, 6-DOF `SE(3)` + per-labware Z-rim/tip `plan_3d_pick_place`, and `autolab-wire/v1` measured clearance & tactile telemetry. |
+| `2026-11-25` | `feat/open-datasets-2026` | Added 12-entry `OPEN_MANIPULATION_DATASETS` registry (`lab_hands/datasets.py`), `scripts/fetch_open_datasets.py`, SPDX commercial-use compliance gates, and LeRobot Parquet/JSONL + FineBio 3D benchtop loaders audited against `ArmSE3`, 96-well clearance, and cylindrical meniscus slosh bounds. |
 
 ---
 
