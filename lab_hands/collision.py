@@ -1,15 +1,15 @@
-"""Exact vectorized 2D segment-vs-AABB clearance, collision checking, and 2.5D Z safety."""
+"""Exact vectorized 2D capsule-vs-AABB clearance, Lipschitz swept-segment checks, and 3D Z safety."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .kinematics import DEFAULT_ARM, Arm2D
-from .labware import DEFAULT_PLATE_96, PlateGeometry
+from .labware import DEFAULT_PLATE_96, DeckLayout, PlateGeometry
 
 DEFAULT_OBSTACLES: Tuple[Tuple[float, float, float, float], ...] = (
     (0.33, -0.08, 0.36, 0.12),  # tube rack wall
@@ -20,7 +20,7 @@ DEFAULT_TUBE_XY: Tuple[float, float] = (-0.05, 0.40)
 
 @dataclass(frozen=True)
 class BenchScene:
-    """Cluttered benchtop workspace with AABB obstacles and 2.5D vessel rim heights."""
+    """Cluttered benchtop workspace with AABB obstacles, per-labware Z rims, and mounted tip length."""
 
     obstacles: Tuple[Tuple[float, float, float, float], ...] = DEFAULT_OBSTACLES
     tube_xy: Tuple[float, float] = DEFAULT_TUBE_XY
@@ -28,9 +28,12 @@ class BenchScene:
     z_tube_bottom: float = 0.010
     z_tube_rim: float = 0.075
     z_plate_rim: float = 0.015
-    z_safe_travel: float = 0.095
-    z_max: float = 0.180
+    z_safe_travel: Optional[float] = None
+    z_max: float = 0.300
+    z_margin_m: float = 0.005
+    attached_tip_length_m: float = 0.0
     plate: PlateGeometry = field(default_factory=lambda: DEFAULT_PLATE_96)
+    deck: Optional[DeckLayout] = None
     _boxes: np.ndarray = field(init=False, repr=False, compare=False)
     _corners: np.ndarray = field(init=False, repr=False, compare=False)
 
@@ -38,8 +41,35 @@ class BenchScene:
         for idx, (x0, y0, x1, y1) in enumerate(self.obstacles):
             if x0 > x1 or y0 > y1:
                 raise ValueError(f"Invalid obstacle[{idx}] bounds ({x0}, {y0}, {x1}, {y1})")
-        if self.z_safe_travel <= max(self.z_tube_rim, self.z_plate_rim):
-            raise ValueError("z_safe_travel must strictly exceed both z_tube_rim and z_plate_rim")
+        if self.attached_tip_length_m < 0.0:
+            raise ValueError(f"attached_tip_length_m must be >= 0, got {self.attached_tip_length_m}")
+        if self.z_margin_m < 0.0:
+            raise ValueError(f"z_margin_m must be >= 0, got {self.z_margin_m}")
+
+        eff_plate_rim = max(float(self.z_plate_rim), float(self.plate.z_rim_m))
+        object.__setattr__(self, "z_plate_rim", eff_plate_rim)
+
+        deck_rim = self.deck.max_rim_m if self.deck is not None else 0.0
+        max_rim = max(float(self.z_tube_rim), eff_plate_rim, deck_rim)
+        min_safe_flange = max_rim + float(self.attached_tip_length_m) + float(self.z_margin_m)
+
+        if self.z_safe_travel is None:
+            resolved_safe = max(0.095, round(min_safe_flange + 0.005, 6))
+            object.__setattr__(self, "z_safe_travel", resolved_safe)
+        else:
+            explicit_safe = float(self.z_safe_travel)
+            if explicit_safe <= max_rim or explicit_safe < min_safe_flange - 1e-12:
+                raise ValueError(
+                    f"z_safe_travel ({explicit_safe:.4f} m) must satisfy >= max_rim + attached_tip_length_m "
+                    f"+ z_margin_m ({min_safe_flange:.4f} m)"
+                )
+            object.__setattr__(self, "z_safe_travel", explicit_safe)
+
+        if float(self.z_safe_travel) > float(self.z_max) + 1e-12:  # type: ignore[arg-type]
+            raise ValueError(
+                f"z_safe_travel ({self.z_safe_travel} m) exceeds z_max ({self.z_max} m)"
+            )
+
         if self.obstacles:
             arr = np.asarray(self.obstacles, dtype=np.float64)
             xmin, ymin, xmax, ymax = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
@@ -61,6 +91,36 @@ class BenchScene:
     @property
     def obstacle_array(self) -> np.ndarray:
         return self._boxes
+
+    @property
+    def max_vessel_rim_m(self) -> float:
+        deck_rim = self.deck.max_rim_m if self.deck is not None else 0.0
+        return max(float(self.z_tube_rim), float(self.z_plate_rim), float(self.plate.z_rim_m), deck_rim)
+
+    def with_attached_tip(
+        self,
+        attached_tip_length_m: float,
+        *,
+        plate: Optional[PlateGeometry] = None,
+        deck: Optional[DeckLayout] = None,
+    ) -> "BenchScene":
+        """Return a copy of this scene updated for a newly mounted/ejected pipette tip or deck."""
+        eff_plate = self.plate if plate is None else plate
+        eff_deck = self.deck if deck is None else deck
+        return BenchScene(
+            obstacles=self.obstacles,
+            tube_xy=self.tube_xy,
+            tube_radius_m=self.tube_radius_m,
+            z_tube_bottom=self.z_tube_bottom,
+            z_tube_rim=self.z_tube_rim,
+            z_plate_rim=max(float(self.z_plate_rim), float(eff_plate.z_rim_m)),
+            z_safe_travel=None,
+            z_max=max(float(self.z_max), 0.300),
+            z_margin_m=self.z_margin_m,
+            attached_tip_length_m=float(attached_tip_length_m),
+            plate=eff_plate,
+            deck=eff_deck,
+        )
 
 
 DEFAULT_SCENE = BenchScene()
@@ -147,19 +207,40 @@ def segment_aabb_distance(
     return np.where(hit, 0.0, np.sqrt(np.minimum(d2_endpoints, d2_corners)))
 
 
+def segment_aabb_clearance(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    boxes: np.ndarray,
+    capsule_radius: float = 0.0,
+    *,
+    _corners: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Exact 2D surface-to-AABB Euclidean clearance for closed link capsule(s) of radius `capsule_radius`."""
+    if capsule_radius < 0.0:
+        raise ValueError(f"capsule_radius must be >= 0, got {capsule_radius}")
+    center_dist = segment_aabb_distance(p0, p1, boxes, _corners=_corners)
+    if capsule_radius == 0.0:
+        return center_dist
+    return np.maximum(0.0, center_dist - float(capsule_radius))
+
+
 def batch_min_clearance(
     qs: np.ndarray,
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
+    *,
+    clearance_m: Optional[float] = None,
 ) -> np.ndarray:
-    """Exact minimum Euclidean link-to-obstacle distance for each configuration in `qs` (..., 2)."""
+    """Exact minimum capsule-surface-to-obstacle clearance for each configuration in `qs` (..., 2)."""
     boxes = scene._boxes
+    qs_arr = np.asarray(qs, dtype=np.float64)
     if boxes.shape[0] == 0:
-        return np.full(qs.shape[:-1], np.inf, dtype=np.float64)
-    e, t = arm.batch_fk(qs)
+        return np.full(qs_arr.shape[:-1], np.inf, dtype=np.float64)
+    cap_r = arm.clearance_m if clearance_m is None else float(clearance_m)
+    e, t = arm.batch_fk(qs_arr)
     o = np.zeros_like(e)
-    d1 = np.min(segment_aabb_distance(o, e, boxes, _corners=scene._corners), axis=-1)
-    d2 = np.min(segment_aabb_distance(e, t, boxes, _corners=scene._corners), axis=-1)
+    d1 = np.min(segment_aabb_clearance(o, e, boxes, capsule_radius=cap_r, _corners=scene._corners), axis=-1)
+    d2 = np.min(segment_aabb_clearance(e, t, boxes, capsule_radius=cap_r, _corners=scene._corners), axis=-1)
     return np.minimum(d1, d2)
 
 
@@ -167,9 +248,11 @@ def min_clearance(
     q: Sequence[float] | np.ndarray,
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
+    *,
+    clearance_m: Optional[float] = None,
 ) -> float:
     arr = np.asarray(q, dtype=np.float64)
-    return float(batch_min_clearance(arr[None, :], arm=arm, scene=scene)[0])
+    return float(batch_min_clearance(arr[None, :], arm=arm, scene=scene, clearance_m=clearance_m)[0])
 
 
 def batch_in_collision(
@@ -186,10 +269,9 @@ def batch_in_collision(
     if boxes.shape[0] == 0:
         return ~in_limits
 
-    pad = (
-        (arm.clearance_m if clearance_m is None else float(clearance_m))
-        + (arm.margin_m if margin_m is None else float(margin_m))
-    )
+    cap_r = arm.clearance_m if clearance_m is None else float(clearance_m)
+    marg = arm.margin_m if margin_m is None else float(margin_m)
+    pad = cap_r + marg
     q1 = arr[..., 0]
     q12 = arr[..., 0] + arr[..., 1]
     ex = arm.l1 * np.cos(q1)
@@ -237,6 +319,17 @@ def in_collision(
     )
 
 
+def kinematic_tip_sweep_bound(
+    a: Sequence[float] | np.ndarray,
+    b: Sequence[float] | np.ndarray,
+    arm: Arm2D = DEFAULT_ARM,
+) -> float:
+    """Exact kinematic Lipschitz upper bound (L1 + L2)*|dq1| + L2*|dq2| on link displacement (m)."""
+    dq0 = abs(float(b[0]) - float(a[0]))
+    dq1 = abs(float(b[1]) - float(a[1]))
+    return float((arm.l1 + arm.l2) * dq0 + arm.l2 * dq1)
+
+
 def edge_subdivision_count(
     a: Sequence[float] | np.ndarray,
     b: Sequence[float] | np.ndarray,
@@ -251,7 +344,7 @@ def edge_subdivision_count(
     dq0 = abs(float(b[0]) - float(a[0]))
     dq1 = abs(float(b[1]) - float(a[1]))
     n_joint = int(math.ceil(math.hypot(dq0, dq1) / step)) + 1
-    tip_sweep_upper = (arm.l1 + arm.l2) * dq0 + arm.l2 * dq1
+    tip_sweep_upper = kinematic_tip_sweep_bound(a, b, arm=arm)
     n_tip = int(math.ceil(tip_sweep_upper / max_tip_step_m)) + 1
     return max(2, n_joint, n_tip)
 
@@ -270,16 +363,32 @@ def edge_free(
     clearance_m: Optional[float] = None,
     margin_m: Optional[float] = None,
 ) -> bool:
-    """Vectorized continuous-step collision check along joint-space segment a -> b."""
+    """Continuous Lipschitz-certified collision check along joint-space segment a -> b."""
     qa = np.asarray(a, dtype=np.float64)
     qb = np.asarray(b, dtype=np.float64)
     if qa.shape != (2,) or qb.shape != (2,):
         raise ValueError("edge_free endpoints must have shape (2,)")
     if not (np.isfinite(qa).all() and np.isfinite(qb).all()):
         return False
+    if not (arm.within_joint_limits(qa) and arm.within_joint_limits(qb)):
+        return False
+
+    cap_r = arm.clearance_m if clearance_m is None else float(clearance_m)
+    base_margin = arm.margin_m if margin_m is None else float(margin_m)
+
+    # Exact zero-discretization check at endpoints s=0 and s=1
+    q_ends = np.stack([qa, qb], axis=0)
+    if bool(np.any(batch_in_collision(q_ends, arm=arm, scene=scene, clearance_m=cap_r, margin_m=base_margin))):
+        return False
+    if scene._boxes.shape[0] == 0:
+        return True
+
+    sweep = kinematic_tip_sweep_bound(qa, qb, arm=arm)
+    if sweep <= 1e-15:
+        return True
+
     n = edge_subdivision_count(qa, qb, arm=arm, step=step, max_tip_step_m=max_tip_step_m)
     diff = qb - qa
-    # Fast 5-point coarse reject for long chords before evaluating dense grid
     if n > 16:
         q_coarse = qa[None, :] + _COARSE_S * diff[None, :]
         if bool(
@@ -288,25 +397,58 @@ def edge_free(
                     q_coarse,
                     arm=arm,
                     scene=scene,
-                    clearance_m=clearance_m,
-                    margin_m=margin_m,
+                    clearance_m=cap_r,
+                    margin_m=base_margin,
                 )
             )
         ):
             return False
-    s = np.linspace(0.0, 1.0, n, dtype=np.float64)[:, None]
-    qs = qa[None, :] + s * diff[None, :]
-    return not bool(
-        np.any(
-            batch_in_collision(
-                qs,
-                arm=arm,
-                scene=scene,
-                clearance_m=clearance_m,
-                margin_m=margin_m,
-            )
-        )
+
+    s = np.linspace(0.0, 1.0, n, dtype=np.float64)
+    qs = qa[None, :] + s[:, None] * diff[None, :]
+    half_step_m = 0.5 * sweep / float(n - 1)
+
+    # Sound fast-accept via LabHandsLean Lipschitz swept-segment margin inflation
+    hits_inflated = batch_in_collision(
+        qs,
+        arm=arm,
+        scene=scene,
+        clearance_m=cap_r,
+        margin_m=base_margin + half_step_m,
     )
+    if not bool(np.any(hits_inflated)):
+        return True
+
+    # Fast-reject if any grid sample already violates base_margin
+    flagged_qs = qs[hits_inflated]
+    if bool(np.any(batch_in_collision(flagged_qs, arm=arm, scene=scene, clearance_m=cap_r, margin_m=base_margin))):
+        return False
+
+    # Adaptive Lipschitz midpoint refinement on only the narrow-band sub-intervals
+    active_mask = hits_inflated[:-1] | hits_inflated[1:]
+    s_lo = s[:-1][active_mask]
+    s_hi = s[1:][active_mask]
+
+    for _ in range(14):
+        if s_lo.size == 0:
+            return True
+        s_mid = 0.5 * (s_lo + s_hi)
+        rad = 0.5 * (s_hi - s_lo) * sweep
+        q_mid = qa[None, :] + s_mid[:, None] * diff[None, :]
+        cl_mid = batch_min_clearance(q_mid, arm=arm, scene=scene, clearance_m=cap_r)
+        if bool(np.any(cl_mid <= base_margin)):
+            return False
+        uncertain = cl_mid <= (base_margin + rad)
+        if not bool(np.any(uncertain)):
+            return True
+        lo_u = s_lo[uncertain]
+        mid_u = s_mid[uncertain]
+        hi_u = s_hi[uncertain]
+        s_lo = np.concatenate([lo_u, mid_u])
+        s_hi = np.concatenate([mid_u, hi_u])
+
+    # Conservative fail-closed guarantee if any sub-interval remains within Lipschitz uncertainty
+    return False
 
 
 def path_min_clearance(
@@ -316,21 +458,100 @@ def path_min_clearance(
     *,
     step: float = 0.02,
     max_tip_step_m: float = 0.002,
+    clearance_m: Optional[float] = None,
 ) -> float:
-    """Minimum link-to-obstacle Euclidean clearance along a piecewise-linear joint path."""
-    if not path:
+    """Certified continuous capsule-to-obstacle Euclidean clearance along a piecewise-linear joint path."""
+    if path is None or len(path) == 0:
         raise ValueError("path must be non-empty")
-    if len(path) == 1:
-        return min_clearance(path[0], arm=arm, scene=scene)
-    best = math.inf
-    for a, b in zip(path, path[1:]):
-        qa = np.asarray(a, dtype=np.float64)
-        qb = np.asarray(b, dtype=np.float64)
-        n = edge_subdivision_count(qa, qb, arm=arm, step=step, max_tip_step_m=max_tip_step_m)
-        s = np.linspace(0.0, 1.0, n, dtype=np.float64)[:, None]
-        qs = qa[None, :] + s * (qb - qa)[None, :]
-        best = min(best, float(np.min(batch_min_clearance(qs, arm=arm, scene=scene))))
-    return best
+    if step <= 0.0 or max_tip_step_m <= 0.0:
+        raise ValueError("step and max_tip_step_m must be > 0")
+    if scene._boxes.shape[0] == 0:
+        return math.inf
+
+    pts = np.asarray(path, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        pts = np.stack([np.asarray(p, dtype=np.float64) for p in path], axis=0)
+    cap_r = arm.clearance_m if clearance_m is None else float(clearance_m)
+    end_cl = batch_min_clearance(pts, arm=arm, scene=scene, clearance_m=cap_r)
+    best_ub = float(np.min(end_cl))
+    if pts.shape[0] == 1 or best_ub <= 0.0:
+        return max(0.0, best_ub)
+
+    qa_all = pts[:-1]
+    diff_all = pts[1:] - qa_all
+    dq_all = np.abs(diff_all)
+    sweeps = (arm.l1 + arm.l2) * dq_all[:, 0] + arm.l2 * dq_all[:, 1]
+    active = sweeps > 1e-15
+    if not bool(np.any(active)):
+        return max(0.0, best_ub)
+
+    qa_act = qa_all[active]
+    diff_act = diff_all[active]
+    sweeps_act = sweeps[active]
+    dq_act = dq_all[active]
+
+    n_joint = np.ceil(np.hypot(dq_act[:, 0], dq_act[:, 1]) / step).astype(np.int64)
+    n_tip = np.ceil(sweeps_act / max_tip_step_m).astype(np.int64)
+    m_subs = np.maximum(1, np.maximum(n_joint, n_tip))
+
+    seg_ids = np.repeat(np.arange(m_subs.size, dtype=np.int64), m_subs)
+    offsets = np.concatenate([[0], np.cumsum(m_subs[:-1])])
+    local_k = np.arange(seg_ids.size, dtype=np.float64) - np.repeat(offsets, m_subs)
+    inv_m = 1.0 / np.repeat(m_subs.astype(np.float64), m_subs)
+    s_lo = local_k * inv_m
+    s_hi = (local_k + 1.0) * inv_m
+
+    certified_floor = best_ub
+    for _ in range(8):
+        if s_lo.size == 0:
+            break
+        s_mid = 0.5 * (s_lo + s_hi)
+        rad = 0.5 * (s_hi - s_lo) * sweeps_act[seg_ids]
+        q_mid = qa_act[seg_ids] + s_mid[:, None] * diff_act[seg_ids]
+        cl_mid = batch_min_clearance(q_mid, arm=arm, scene=scene, clearance_m=cap_r)
+        mid_min = float(np.min(cl_mid))
+        if mid_min < best_ub:
+            best_ub = mid_min
+        if best_ub <= 0.0:
+            return 0.0
+
+        lb = cl_mid - rad
+        safe = lb >= (best_ub - 1e-6)
+        if bool(np.any(safe)):
+            certified_floor = min(certified_floor, float(np.min(lb[safe])))
+        refine = ~safe
+        if not bool(np.any(refine)):
+            s_lo = np.empty(0, dtype=np.float64)
+            break
+        seg_r = seg_ids[refine]
+        lo_r = s_lo[refine]
+        mid_r = s_mid[refine]
+        hi_r = s_hi[refine]
+        seg_ids = np.concatenate([seg_r, seg_r])
+        s_lo = np.concatenate([lo_r, mid_r])
+        s_hi = np.concatenate([mid_r, hi_r])
+
+    if s_lo.size > 0:
+        s_mid = 0.5 * (s_lo + s_hi)
+        rad = 0.5 * (s_hi - s_lo) * sweeps_act[seg_ids]
+        q_mid = qa_act[seg_ids] + s_mid[:, None] * diff_act[seg_ids]
+        cl_mid = batch_min_clearance(q_mid, arm=arm, scene=scene, clearance_m=cap_r)
+        certified_floor = min(certified_floor, float(np.min(cl_mid - rad)))
+
+    return max(0.0, min(best_ub, certified_floor))
+
+
+def _collect_allowed_wells(
+    allowed_well_xy: Optional[np.ndarray | Sequence[float]],
+    allowed_wells_xy: Optional[Iterable[Sequence[float] | np.ndarray]],
+) -> List[np.ndarray]:
+    pts: List[np.ndarray] = []
+    if allowed_well_xy is not None:
+        pts.append(np.asarray(allowed_well_xy, dtype=np.float64))
+    if allowed_wells_xy is not None:
+        for w in allowed_wells_xy:
+            pts.append(np.asarray(w, dtype=np.float64))
+    return pts
 
 
 def in_collision_3d(
@@ -338,42 +559,63 @@ def in_collision_3d(
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
     *,
-    allowed_well_xy: Optional[np.ndarray] = None,
+    allowed_well_xy: Optional[np.ndarray | Sequence[float]] = None,
+    allowed_wells_xy: Optional[Iterable[Sequence[float] | np.ndarray]] = None,
     z_margin_m: float = 0.003,
 ) -> bool:
-    """2.5D SCARA collision check on state (q1, q2, z) enforcing vessel rim clearances."""
+    """2.5D/3D collision check on (q1, q2, z_flange) enforcing per-labware rims and attached tip length."""
     arr = np.asarray(state_3d, dtype=np.float64)
     if arr.shape != (3,) or not np.isfinite(arr).all():
         return True
     q = arr[:2]
-    z = float(arr[2])
-    if z < 0.0 or z > scene.z_max:
+    z_flange = float(arr[2])
+    z_tip = z_flange - float(scene.attached_tip_length_m)
+    if z_tip < -1e-12 or z_flange > float(scene.z_max) + 1e-12:
         return True
     if in_collision(q, arm=arm, scene=scene):
         return True
-    if z >= scene.z_safe_travel - 1e-12:
-        return False
 
     _, tip = arm.fk(q)
-    tube_pt = np.asarray(scene.tube_xy, dtype=np.float64)
-    if float(np.linalg.norm(tip - tube_pt)) <= scene.tube_radius_m and z >= scene.z_tube_bottom - 1e-9:
-        return False
-    if allowed_well_xy is not None:
-        well_pt = np.asarray(allowed_well_xy, dtype=np.float64)
-        if float(np.linalg.norm(tip - well_pt)) <= scene.plate.well_radius_m and z >= scene.plate.z_bottom_m - 1e-9:
-            return False
+    eff_margin = max(float(z_margin_m), 0.0)
+    allowed_pts = _collect_allowed_wells(allowed_well_xy, allowed_wells_xy)
 
-    if z < scene.z_tube_rim + z_margin_m and float(np.linalg.norm(tip - tube_pt)) <= 0.03:
-        return True
-    if z < scene.z_plate_rim + z_margin_m:
-        ox, oy = scene.plate.origin_xy
-        px_min = ox - 0.015
-        px_max = ox + (scene.plate.cols - 1) * scene.plate.pitch_x + 0.015
-        py_min = oy - (scene.plate.rows - 1) * scene.plate.pitch_y - 0.015
-        py_max = oy + 0.015
-        if px_min <= tip[0] <= px_max and py_min <= tip[1] <= py_max:
+    # 1. Source tube bore and collar check
+    tube_pt = np.asarray(scene.tube_xy, dtype=np.float64)
+    dist_tube = float(np.linalg.norm(tip - tube_pt))
+    if dist_tube <= scene.tube_radius_m:
+        if z_tip < scene.z_tube_bottom - 1e-9:
             return True
-    return True
+        return False
+    if dist_tube <= 0.03 and z_tip < scene.z_tube_rim + eff_margin - 1e-12:
+        return True
+
+    # 2. Check primary plate + all multi-labware deck footprints using true per-labware z_rim_m
+    labware_items: List[Tuple[PlateGeometry, float]] = [
+        (scene.plate, max(float(scene.z_plate_rim), float(scene.plate.z_rim_m)))
+    ]
+    if scene.deck is not None:
+        for geom in scene.deck.labware_by_alias.values():
+            labware_items.append((geom, float(geom.z_rim_m)))
+
+    for geom, rim_z in labware_items:
+        px_min, px_max, py_min, py_max = geom.footprint_bounds()
+        if px_min <= float(tip[0]) <= px_max and py_min <= float(tip[1]) <= py_max:
+            in_allowed_bore = False
+            for w_pt in allowed_pts:
+                if (
+                    px_min <= float(w_pt[0]) <= px_max
+                    and py_min <= float(w_pt[1]) <= py_max
+                    and float(np.linalg.norm(tip - w_pt)) <= geom.well_radius_m + 1e-9
+                ):
+                    if z_tip < geom.z_bottom_m - 1e-9:
+                        return True
+                    in_allowed_bore = True
+                    break
+            if not in_allowed_bore and z_tip < rim_z + eff_margin - 1e-12:
+                return True
+
+    # 3. Free space outside tube and labware footprints is collision-free for 0 <= z_tip and z_flange <= z_max
+    return False
 
 
 def edge_free_3d(
@@ -382,22 +624,37 @@ def edge_free_3d(
     arm: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
     *,
-    allowed_well_xy: Optional[np.ndarray] = None,
+    allowed_well_xy: Optional[np.ndarray | Sequence[float]] = None,
+    allowed_wells_xy: Optional[Iterable[Sequence[float] | np.ndarray]] = None,
+    z_margin_m: float = 0.003,
 ) -> bool:
-    """Verify 3-DoF SCARA segment (q1, q2, z) avoids planar obstacles and rim tip-shearing."""
+    """Verify 3D segment (q1, q2, z_flange) avoids planar obstacles and vessel/tiprack rim shearing."""
     sa = np.asarray(a_3d, dtype=np.float64)
     sb = np.asarray(b_3d, dtype=np.float64)
     if sa.shape != (3,) or sb.shape != (3,):
         raise ValueError("edge_free_3d endpoints must have shape (3,)")
     dq_norm = float(np.linalg.norm(sb[:2] - sa[:2]))
-    min_z = min(float(sa[2]), float(sb[2]))
-    if dq_norm > 1e-9 and min_z < scene.z_safe_travel - 1e-9:
+    min_z_flange = min(float(sa[2]), float(sb[2]))
+    req_safe_flange = max(
+        float(scene.z_safe_travel),  # type: ignore[arg-type]
+        scene.max_vessel_rim_m + float(scene.attached_tip_length_m) + max(float(z_margin_m), float(scene.z_margin_m)),
+    )
+    if dq_norm > 1e-9 and min_z_flange < req_safe_flange - 1e-9:
+        return False
+    if dq_norm > 1e-9 and not edge_free(sa[:2], sb[:2], arm=arm, scene=scene):
         return False
     n_xy = edge_subdivision_count(sa[:2], sb[:2], arm=arm)
     n_z = int(math.ceil(abs(float(sb[2] - sa[2])) / 0.002)) + 1
     n = max(2, n_xy, n_z)
     for alpha in np.linspace(0.0, 1.0, n):
         st = sa + float(alpha) * (sb - sa)
-        if in_collision_3d(st, arm=arm, scene=scene, allowed_well_xy=allowed_well_xy):
+        if in_collision_3d(
+            st,
+            arm=arm,
+            scene=scene,
+            allowed_well_xy=allowed_well_xy,
+            allowed_wells_xy=allowed_wells_xy,
+            z_margin_m=z_margin_m,
+        ):
             return False
     return True
