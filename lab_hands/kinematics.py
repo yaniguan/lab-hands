@@ -143,13 +143,18 @@ class PoseSE3:
 
 @dataclass(frozen=True)
 class ArmSE3:
-    """6R spherical-wrist cobot kinematic model (SO-ARM100 / UR5e benchtop class) in SE(3)."""
+    """Synthetic 6R spherical-wrist toy kinematic model in SE(3) (not UR5e or Franka)."""
 
     z_base: float = 0.10
     l_upper: float = 0.35
     l_forearm: float = 0.32
     joint_limits: Tuple[Tuple[float, float], ...] = DEFAULT_SE3_JOINT_LIMITS
     max_plunge_tilt_rad: float = math.radians(1.5)
+    robot_type: str = "arm_se3"
+
+    @property
+    def n_joints(self) -> int:
+        return 6
 
     def __post_init__(self) -> None:
         if self.l_upper <= 0.0 or self.l_forearm <= 0.0:
@@ -351,3 +356,151 @@ class Arm2D:
 
 DEFAULT_ARM = Arm2D()
 DEFAULT_ARM_SE3 = ArmSE3()
+
+
+def _std_dh_matrix(theta: float, d: float, a: float, alpha: float) -> np.ndarray:
+    ct, st = math.cos(theta), math.sin(theta)
+    ca, sa = math.cos(alpha), math.sin(alpha)
+    return np.array(
+        [
+            [ct, -st * ca, st * sa, a * ct],
+            [st, ct * ca, -ct * sa, a * st],
+            [0.0, sa, ca, d],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _craig_mdh_matrix(a_prev: float, alpha_prev: float, d: float, theta: float) -> np.ndarray:
+    ct, st = math.cos(theta), math.sin(theta)
+    ca, sa = math.cos(alpha_prev), math.sin(alpha_prev)
+    return np.array(
+        [
+            [ct, -st, 0.0, a_prev],
+            [st * ca, ct * ca, -sa, -d * sa],
+            [st * sa, ct * sa, ca, d * ca],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+@dataclass(frozen=True)
+class UR5eRobotModel:
+    """Published Universal Robots UR5e 6-DoF Standard-DH flange kinematic model."""
+
+    d_m: Tuple[float, ...] = (0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996)
+    a_m: Tuple[float, ...] = (0.0, -0.425, -0.3922, 0.0, 0.0, 0.0)
+    alpha_rad: Tuple[float, ...] = (math.pi / 2.0, 0.0, 0.0, math.pi / 2.0, -math.pi / 2.0, 0.0)
+    joint_limits: Tuple[Tuple[float, float], ...] = ((-2.0 * math.pi, 2.0 * math.pi),) * 6
+    max_plunge_tilt_rad: float = math.radians(1.5)
+    robot_type: str = "ur5e"
+
+    @property
+    def n_joints(self) -> int:
+        return 6
+
+    def within_joint_limits(self, q: Sequence[float] | np.ndarray, tol: float = 1e-9) -> bool:
+        arr = np.asarray(q, dtype=np.float64)
+        if arr.shape != (6,) or not np.isfinite(arr).all():
+            return False
+        return all(lo - tol <= float(v) <= hi + tol for v, (lo, hi) in zip(arr, self.joint_limits))
+
+    def fk_matrix(self, q: Sequence[float] | np.ndarray) -> np.ndarray:
+        arr = np.asarray(q, dtype=np.float64)
+        if arr.shape != (6,):
+            raise ValueError(f"Expected 6-DoF UR5e joint vector of shape (6,), got {arr.shape}")
+        tf = np.eye(4, dtype=np.float64)
+        for qi, d, a, al in zip(arr, self.d_m, self.a_m, self.alpha_rad):
+            tf = tf @ _std_dh_matrix(float(qi), d, a, al)
+        return tf
+
+    def fk_se3(self, q: Sequence[float] | np.ndarray) -> PoseSE3:
+        tf = self.fk_matrix(q)
+        return PoseSE3(
+            xyz=(float(tf[0, 3]), float(tf[1, 3]), float(tf[2, 3])),
+            rpy=_rot_to_rpy(tf[:3, :3]),
+        )
+
+
+@dataclass(frozen=True)
+class FrankaRobotModel:
+    """Published Franka Emika Panda 7-DoF Craig Modified-DH flange kinematic model."""
+
+    a_prev_m: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0825, -0.0825, 0.0, 0.088)
+    alpha_prev_rad: Tuple[float, ...] = (
+        0.0,
+        -math.pi / 2.0,
+        math.pi / 2.0,
+        math.pi / 2.0,
+        -math.pi / 2.0,
+        math.pi / 2.0,
+        math.pi / 2.0,
+    )
+    d_m: Tuple[float, ...] = (0.333, 0.0, 0.316, 0.0, 0.384, 0.0, 0.0)
+    d_flange_m: float = 0.107
+    joint_limits: Tuple[Tuple[float, float], ...] = (
+        (-2.8973, 2.8973),
+        (-1.7628, 1.7628),
+        (-2.8973, 2.8973),
+        (-3.0718, -0.0698),
+        (-2.8973, 2.8973),
+        (-0.0175, 3.7525),
+        (-2.8973, 2.8973),
+    )
+    max_plunge_tilt_rad: float = math.radians(1.5)
+    robot_type: str = "franka"
+
+    @property
+    def n_joints(self) -> int:
+        return 7
+
+    def within_joint_limits(self, q: Sequence[float] | np.ndarray, tol: float = 1e-6) -> bool:
+        arr = np.asarray(q, dtype=np.float64)
+        if arr.shape != (7,) or not np.isfinite(arr).all():
+            return False
+        return all(lo - tol <= float(v) <= hi + tol for v, (lo, hi) in zip(arr, self.joint_limits))
+
+    def fk_matrix(self, q: Sequence[float] | np.ndarray) -> np.ndarray:
+        arr = np.asarray(q, dtype=np.float64)
+        if arr.shape != (7,):
+            raise ValueError(f"Expected 7-DoF Franka joint vector of shape (7,), got {arr.shape}")
+        tf = np.eye(4, dtype=np.float64)
+        for qi, a_p, al_p, d_i in zip(arr, self.a_prev_m, self.alpha_prev_rad, self.d_m):
+            tf = tf @ _craig_mdh_matrix(a_p, al_p, d_i, float(qi))
+        tf_flange = np.eye(4, dtype=np.float64)
+        tf_flange[2, 3] = float(self.d_flange_m)
+        return tf @ tf_flange
+
+    def fk_se3(self, q: Sequence[float] | np.ndarray) -> PoseSE3:
+        tf = self.fk_matrix(q)
+        return PoseSE3(
+            xyz=(float(tf[0, 3]), float(tf[1, 3]), float(tf[2, 3])),
+            rpy=_rot_to_rpy(tf[:3, :3]),
+        )
+
+
+DEFAULT_UR5E_MODEL = UR5eRobotModel()
+DEFAULT_FRANKA_MODEL = FrankaRobotModel()
+
+ROBOT_MODELS_SE3 = {
+    "ur5e": DEFAULT_UR5E_MODEL,
+    "ur5": DEFAULT_UR5E_MODEL,
+    "franka": DEFAULT_FRANKA_MODEL,
+    "panda": DEFAULT_FRANKA_MODEL,
+    "franka_panda": DEFAULT_FRANKA_MODEL,
+    "franka_emika_panda": DEFAULT_FRANKA_MODEL,
+    "arm_se3": DEFAULT_ARM_SE3,
+    "synthetic_arm_se3": DEFAULT_ARM_SE3,
+}
+
+
+def get_robot_model_se3(robot_type: Optional[str]) -> Optional[ArmSE3 | UR5eRobotModel | FrankaRobotModel]:
+    """Return the published SE(3) robot kinematic model for `robot_type`, or `None` if unknown."""
+    if robot_type is None:
+        return None
+    key = str(robot_type).strip().lower().replace("-", "_").replace(" ", "_")
+    if not key:
+        return None
+    return ROBOT_MODELS_SE3.get(key)

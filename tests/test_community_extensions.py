@@ -33,10 +33,21 @@ from lab_hands import in_collision, min_clearance  # noqa: E402
 
 
 def test_fundamental_cylindrical_slosh_dispersion() -> None:
-    omega = compute_fundamental_slosh_omega(well_radius_m=0.00345, fill_height_m=0.0090)
-    expected = math.sqrt(1.841 * 9.80665 / 0.00345) * math.tanh(1.841 * 0.0090 / 0.00345)
-    assert abs(omega - expected) < 1e-9
-    assert 70.0 < omega < 75.0
+    from lab_hands.trajectory import SLOSH_BESSEL_XI_11, SLOSH_GRAVITY_M_S2, slosh_bond_number, slosh_natural_frequency
+
+    r_96 = 0.00345
+    for fill_mm in (0.5, 2.0, 9.2):
+        h_m = fill_mm / 1000.0
+        omega = slosh_natural_frequency(r_96, h_m)
+        omega_ext = compute_fundamental_slosh_omega(r_96, h_m)
+        expected = math.sqrt((SLOSH_BESSEL_XI_11 * SLOSH_GRAVITY_M_S2 / r_96) * math.tanh(SLOSH_BESSEL_XI_11 * h_m / r_96))
+        assert omega == pytest.approx(expected, rel=1e-12)
+        assert omega_ext == pytest.approx(expected, rel=1e-12)
+
+    # At 0.5 mm fill (R = 3.45 mm), standard linear Bessel dispersion gives ~36.9 rad/s (not 18.9 rad/s!)
+    assert slosh_natural_frequency(0.00345, 0.0005) == pytest.approx(36.9383, abs=0.05)
+    assert 70.0 < compute_fundamental_slosh_omega(0.00345, 0.0090) < 75.0
+    assert slosh_bond_number(0.00345) == pytest.approx(1.621, abs=0.05)
 
     with pytest.raises(ValueError, match="strictly positive"):
         compute_fundamental_slosh_omega(0.0, 0.005)

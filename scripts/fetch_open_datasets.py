@@ -128,6 +128,15 @@ def fetch_dataset_sample(
                 rows_path = target_dir / "sample_rows.json"
                 rows_path.write_bytes(rows_bytes)
                 manifest["artifacts"].append("sample_rows.json")
+    elif spec.dataset_id == "finebio":
+        gt_url = "https://raw.githubusercontent.com/aistairc/FineBio/main/step_segmentation/data/groundTruth/P01_01_01.txt"
+        try:
+            st_gt, gt_bytes = _http_get_bytes(gt_url, max_bytes=262_144, timeout_s=timeout_s)
+            if st_gt == 200:
+                (target_dir / "P01_01_01.txt").write_bytes(gt_bytes)
+                manifest["artifacts"].append("P01_01_01.txt")
+        except Exception:
+            pass
 
     manifest_path = target_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -195,6 +204,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="lerobot",
         help="Schema of --audit-sample input file.",
     )
+    parser.add_argument(
+        "--robot-type",
+        type=str,
+        default=None,
+        help="Optional robot_type override ('ur5e', 'franka', or 'arm_se3') when auditing standalone JSONL files.",
+    )
     return parser
 
 
@@ -219,10 +234,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.audit_sample is not None:
         if args.sample_kind == "lerobot":
-            ep = load_lerobot_episode(args.audit_sample)
+            ep = load_lerobot_episode(args.audit_sample, robot_type=args.robot_type)
             audit = audit_lerobot_episode(ep)
             print(json.dumps(audit.to_dict(), indent=2, sort_keys=True))
-            return 0 if audit.safe else 2
+            return 0 if audit.safe is True else 2
         anns = load_finebio_annotations(args.audit_sample)
         audits = audit_finebio_annotations(anns)
         print(json.dumps([a.to_dict() for a in audits], indent=2, sort_keys=True))

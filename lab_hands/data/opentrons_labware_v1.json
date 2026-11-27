@@ -1,0 +1,397 @@
+{
+  "schema": "lab-hands/opentrons-labware-z-sync/v1",
+  "source_package": "opentrons-shared-data",
+  "source_version": "8.8.2",
+  "definition_version": 1,
+  "spdx_license": "Apache-2.0",
+  "license_notice": "Derived from Opentrons labware definitions in opentrons-shared-data (Copyright Opentrons Labworks, Inc.), licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).",
+  "labware": {
+    "corning_96_wellplate_360ul_flat": {
+      "load_name": "corning_96_wellplate_360ul_flat",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.47,
+      "zDimension_mm": 14.22,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 3.55,
+        "depth_mm": 10.67,
+        "diameter_mm": 6.86
+      },
+      "well_radius_mm": 3.43,
+      "isTiprack": false
+    },
+    "corning_384_wellplate_112ul_flat": {
+      "load_name": "corning_384_wellplate_112ul_flat",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.47,
+      "zDimension_mm": 14.22,
+      "a1": {
+        "shape": "rectangular",
+        "z_mm": 2.79,
+        "depth_mm": 11.43,
+        "xDimension_mm": 3.63,
+        "yDimension_mm": 3.63
+      },
+      "well_radius_mm": 1.815,
+      "isTiprack": false
+    },
+    "corning_24_wellplate_3.4ml_flat": {
+      "load_name": "corning_24_wellplate_3.4ml_flat",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.47,
+      "zDimension_mm": 20.27,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 2.87,
+        "depth_mm": 17.4,
+        "diameter_mm": 16.26
+      },
+      "well_radius_mm": 8.13,
+      "isTiprack": false
+    },
+    "corning_12_wellplate_6.9ml_flat": {
+      "load_name": "corning_12_wellplate_6.9ml_flat",
+      "version": 1,
+      "xDimension_mm": 127.89,
+      "yDimension_mm": 85.6,
+      "zDimension_mm": 20.02,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 2.49,
+        "depth_mm": 17.53,
+        "diameter_mm": 22.73
+      },
+      "well_radius_mm": 11.365,
+      "isTiprack": false
+    },
+    "corning_6_wellplate_16.8ml_flat": {
+      "load_name": "corning_6_wellplate_16.8ml_flat",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.47,
+      "zDimension_mm": 20.27,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 2.87,
+        "depth_mm": 17.4,
+        "diameter_mm": 35.43
+      },
+      "well_radius_mm": 17.715,
+      "isTiprack": false
+    },
+    "nest_96_wellplate_200ul_flat": {
+      "load_name": "nest_96_wellplate_200ul_flat",
+      "version": 1,
+      "xDimension_mm": 127.56,
+      "yDimension_mm": 85.36,
+      "zDimension_mm": 14.3,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 3.5,
+        "depth_mm": 10.8,
+        "diameter_mm": 6.85
+      },
+      "well_radius_mm": 3.425,
+      "isTiprack": false
+    },
+    "nest_96_wellplate_100ul_pcr_full_skirt": {
+      "load_name": "nest_96_wellplate_100ul_pcr_full_skirt",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 15.7,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 0.92,
+        "depth_mm": 14.78,
+        "diameter_mm": 5.34
+      },
+      "well_radius_mm": 2.67,
+      "isTiprack": false
+    },
+    "nest_96_wellplate_2ml_deep": {
+      "load_name": "nest_96_wellplate_2ml_deep",
+      "version": 1,
+      "xDimension_mm": 127.6,
+      "yDimension_mm": 85.3,
+      "zDimension_mm": 41.0,
+      "a1": {
+        "shape": "rectangular",
+        "z_mm": 3.0,
+        "depth_mm": 38.0,
+        "xDimension_mm": 8.2,
+        "yDimension_mm": 8.2
+      },
+      "well_radius_mm": 4.1,
+      "isTiprack": false
+    },
+    "nest_12_reservoir_15ml": {
+      "load_name": "nest_12_reservoir_15ml",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 31.4,
+      "a1": {
+        "shape": "rectangular",
+        "z_mm": 4.55,
+        "depth_mm": 26.85,
+        "xDimension_mm": 8.2,
+        "yDimension_mm": 71.2
+      },
+      "well_radius_mm": 4.1,
+      "isTiprack": false
+    },
+    "nest_1_reservoir_195ml": {
+      "load_name": "nest_1_reservoir_195ml",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 31.4,
+      "a1": {
+        "shape": "rectangular",
+        "z_mm": 4.55,
+        "depth_mm": 25.0,
+        "xDimension_mm": 106.8,
+        "yDimension_mm": 71.2
+      },
+      "well_radius_mm": 35.6,
+      "isTiprack": false
+    },
+    "usascientific_12_reservoir_22ml": {
+      "load_name": "usascientific_12_reservoir_22ml",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.8,
+      "zDimension_mm": 44.45,
+      "a1": {
+        "shape": "rectangular",
+        "z_mm": 2.29,
+        "depth_mm": 42.16,
+        "xDimension_mm": 8.33,
+        "yDimension_mm": 71.88
+      },
+      "well_radius_mm": 4.165,
+      "isTiprack": false
+    },
+    "agilent_1_reservoir_290ml": {
+      "load_name": "agilent_1_reservoir_290ml",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.57,
+      "zDimension_mm": 44.04,
+      "a1": {
+        "shape": "rectangular",
+        "z_mm": 4.82,
+        "depth_mm": 39.22,
+        "xDimension_mm": 108.0,
+        "yDimension_mm": 72.0
+      },
+      "well_radius_mm": 36.0,
+      "isTiprack": false
+    },
+    "opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap": {
+      "load_name": "opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap",
+      "version": 1,
+      "xDimension_mm": 127.75,
+      "yDimension_mm": 85.5,
+      "zDimension_mm": 79.85,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 42.05,
+        "depth_mm": 37.8,
+        "diameter_mm": 8.7
+      },
+      "well_radius_mm": 4.35,
+      "isTiprack": false
+    },
+    "opentrons_24_tuberack_nest_1.5ml_snapcap": {
+      "load_name": "opentrons_24_tuberack_nest_1.5ml_snapcap",
+      "version": 1,
+      "xDimension_mm": 127.75,
+      "yDimension_mm": 85.5,
+      "zDimension_mm": 79.55,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 41.65,
+        "depth_mm": 37.9,
+        "diameter_mm": 10.2
+      },
+      "well_radius_mm": 5.1,
+      "isTiprack": false
+    },
+    "opentrons_15_tuberack_falcon_15ml_conical": {
+      "load_name": "opentrons_15_tuberack_falcon_15ml_conical",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 124.35,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 6.85,
+        "depth_mm": 117.5,
+        "diameter_mm": 14.9
+      },
+      "well_radius_mm": 7.45,
+      "isTiprack": false
+    },
+    "opentrons_6_tuberack_falcon_50ml_conical": {
+      "load_name": "opentrons_6_tuberack_falcon_50ml_conical",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 120.3,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 7.3,
+        "depth_mm": 113.0,
+        "diameter_mm": 27.81
+      },
+      "well_radius_mm": 13.905,
+      "isTiprack": false
+    },
+    "opentrons_10_tuberack_falcon_4x50ml_6x15ml_conical": {
+      "load_name": "opentrons_10_tuberack_falcon_4x50ml_6x15ml_conical",
+      "version": 1,
+      "xDimension_mm": 127.75,
+      "yDimension_mm": 85.5,
+      "zDimension_mm": 124.35,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 6.85,
+        "depth_mm": 117.5,
+        "diameter_mm": 14.9
+      },
+      "well_radius_mm": 7.45,
+      "isTiprack": false
+    },
+    "opentrons_96_tiprack_300ul": {
+      "load_name": "opentrons_96_tiprack_300ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 64.49,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 5.39,
+        "depth_mm": 59.3,
+        "diameter_mm": 5.23
+      },
+      "well_radius_mm": 2.615,
+      "isTiprack": true,
+      "tipLength_mm": 59.3,
+      "tipOverlap_mm": 7.47,
+      "effectiveTipLength_mm": 51.83
+    },
+    "opentrons_96_tiprack_20ul": {
+      "load_name": "opentrons_96_tiprack_20ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 64.69,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 25.49,
+        "depth_mm": 39.2,
+        "diameter_mm": 3.27
+      },
+      "well_radius_mm": 1.635,
+      "isTiprack": true,
+      "tipLength_mm": 39.2,
+      "tipOverlap_mm": 8.25,
+      "effectiveTipLength_mm": 30.95
+    },
+    "opentrons_96_tiprack_10ul": {
+      "load_name": "opentrons_96_tiprack_10ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 64.69,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 25.49,
+        "depth_mm": 39.2,
+        "diameter_mm": 3.27
+      },
+      "well_radius_mm": 1.635,
+      "isTiprack": true,
+      "tipLength_mm": 39.2,
+      "tipOverlap_mm": 3.29,
+      "effectiveTipLength_mm": 35.91
+    },
+    "opentrons_96_tiprack_1000ul": {
+      "load_name": "opentrons_96_tiprack_1000ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 97.47,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 9.47,
+        "depth_mm": 88.0,
+        "diameter_mm": 7.23
+      },
+      "well_radius_mm": 3.615,
+      "isTiprack": true,
+      "tipLength_mm": 88.0,
+      "tipOverlap_mm": 7.95,
+      "effectiveTipLength_mm": 80.05
+    },
+    "opentrons_96_filtertiprack_200ul": {
+      "load_name": "opentrons_96_filtertiprack_200ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 64.49,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 5.39,
+        "depth_mm": 59.3,
+        "diameter_mm": 5.23
+      },
+      "well_radius_mm": 2.615,
+      "isTiprack": true,
+      "tipLength_mm": 59.3,
+      "tipOverlap_mm": 7.47,
+      "effectiveTipLength_mm": 51.83
+    },
+    "opentrons_96_filtertiprack_20ul": {
+      "load_name": "opentrons_96_filtertiprack_20ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 64.69,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 25.49,
+        "depth_mm": 39.2,
+        "diameter_mm": 3.27
+      },
+      "well_radius_mm": 1.635,
+      "isTiprack": true,
+      "tipLength_mm": 39.2,
+      "tipOverlap_mm": 3.29,
+      "effectiveTipLength_mm": 35.91
+    },
+    "opentrons_96_filtertiprack_1000ul": {
+      "load_name": "opentrons_96_filtertiprack_1000ul",
+      "version": 1,
+      "xDimension_mm": 127.76,
+      "yDimension_mm": 85.48,
+      "zDimension_mm": 97.47,
+      "a1": {
+        "shape": "circular",
+        "z_mm": 9.47,
+        "depth_mm": 88.0,
+        "diameter_mm": 7.23
+      },
+      "well_radius_mm": 3.615,
+      "isTiprack": true,
+      "tipLength_mm": 88.0,
+      "tipOverlap_mm": 7.95,
+      "effectiveTipLength_mm": 80.05
+    }
+  }
+}

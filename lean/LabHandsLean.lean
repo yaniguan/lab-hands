@@ -9,9 +9,11 @@ Formalizes the `lab-hands` (Layer L1) benchtop manipulation and trajectory time-
    at every interior point along `[0, 1]`.
 3. **Self-Collision & Rim Transit Bounds**: `|q2| <= 2600 mrad` and `0 <= vesselRimClearZMM`.
 4. **Open-Meniscus Pendulum-Slosh Minimum-Jerk Gate (Idea #19)**: Time-scaled trajectories
-   keep predicted dynamic meniscus rise strictly below `0.7 * h_free`
-   (`10 * predMeniscusRiseUM < 7 * freeHeadspaceUM`), guaranteeing zero well spills while
-   maintaining `>= 5 mm` continuous obstacle clearance.
+   keep the predicted surrogate meniscus rise strictly below `0.7 * h_free`
+   (`10 * predMeniscusRiseUM < 7 * freeHeadspaceUM`, hence `predMeniscusRiseUM < freeHeadspaceUM`)
+   under the flat-surface linear gravity model while maintaining `>= 5 mm` continuous obstacle
+   clearance. Note (`#37`): this bounds the integer surrogate prediction under the model and
+   does not by itself guarantee physical spill absence in capillary-dominated microplates (`Bo < 5`).
 -/
 namespace LabHandsLean
 
@@ -334,9 +336,11 @@ theorem sloshScaled_meniscus_strictly_below_70pct_headspace (s : SloshScaledTraj
     simp only [ha, firstViolation_cons, firstViolation_nil, and_true, decide_eq_true_eq] at hok
     exact ⟨hok.1, hok.2.1⟩
 
-/-- Zero-Spill Theorem: Any accepted open-meniscus trajectory satisfies
-    `predMeniscusRiseUM < freeHeadspaceUM`, guaranteeing zero well-to-well spills. -/
-theorem sloshScaled_zero_well_spills (s : SloshScaledTrajectoryCheck)
+/-- Surrogate Headspace Bound Theorem: Any accepted trajectory satisfies
+    `predMeniscusRiseUM < freeHeadspaceUM` for the predicted rise under the linear gravity model
+    (bounding the model's predicted integer rise below `0.7 * h_free`, without claiming physical
+    spill immunity in capillary-dominated microplates). -/
+theorem sloshScaled_predicted_rise_below_headspace (s : SloshScaledTrajectoryCheck)
     (hok : checkSloshScaledTrajectory s = none) :
     s.predMeniscusRiseUM < s.freeHeadspaceUM := by
   have ⟨hpos, h70⟩ := sloshScaled_meniscus_strictly_below_70pct_headspace s hok
@@ -410,5 +414,122 @@ def grazingSweptSeg : SweptSegmentCheck :=
 
 -- Duration shorter than analytical minimum `T*` is rejected
 #guard (checkSloshScaledTrajectory { validSloshScaled with durationMs := 650 }).isSome == true
+
+/-! ## Frontier 6-DoF Swept-Volume, Input-Shaper Convexity & Whitney Non-Wedging Proofs -/
+
+/-- Conservative 6-DoF cobot Jacobian Lipschitz sweep upper bound in micrometers (`mm * mrad = um`). -/
+def tipSweepBound6DoFUM
+    (r1MM r2MM r3MM r4MM r5MM r6MM dq1Mrad dq2Mrad dq3Mrad dq4Mrad dq5Mrad dq6Mrad : Nat) : Nat :=
+  r1MM * dq1Mrad + r2MM * dq2Mrad + r3MM * dq3Mrad +
+  r4MM * dq4Mrad + r5MM * dq5Mrad + r6MM * dq6Mrad
+
+/-- **Continuous 6-DoF SE(3) Swept-Segment Soundness Theorem**:
+    Generalizes `sweptSegment_continuous_clearance_sound` to arbitrary 6-DoF serial chains (`UR5e`):
+    if every grid sample `k in 0..nIntervals` satisfies `reqMarginUM + halfStepSweepUM sweep6UM nIntervals <= clearanceUM(2*k*res)`,
+    every continuous parameter `pos <= 2 * nIntervals * res` maintains `reqMarginUM <= clearanceUM pos`. -/
+theorem sweptSegment6DoF_continuous_clearance_sound
+    (sweep6UM nIntervals res reqMarginUM : Nat)
+    (clearanceUM : Nat → Int)
+    (hn : 0 < nIntervals)
+    (hres : 0 < res)
+    (hLip : ∀ p q : Nat,
+      ((2 * nIntervals * res : Nat) : Int) * (clearanceUM p - clearanceUM q) ≤
+        (sweep6UM : Int) * (natAbsDiff p q : Int))
+    (hGrid : ∀ k : Nat, k ≤ nIntervals →
+      ((reqMarginUM + halfStepSweepUM sweep6UM nIntervals : Nat) : Int) ≤
+        clearanceUM (2 * k * res)) :
+    ∀ pos : Nat, pos ≤ 2 * nIntervals * res → (reqMarginUM : Int) ≤ clearanceUM pos := by
+  intro pos hpos
+  have hD_pos : (0 : Int) < ((2 * nIntervals * res : Nat) : Int) := by
+    have : 0 < 2 * nIntervals * res := Nat.mul_pos (by omega) hres
+    omega
+  have ⟨hk, hdist⟩ := nearestGridIndex_bounds nIntervals res pos hres hpos
+  have hsample := hGrid (nearestGridIndex res pos) hk
+  have hstep1 := hLip (2 * nearestGridIndex res pos * res) pos
+  have hnat1 : sweep6UM * natAbsDiff (2 * nearestGridIndex res pos * res) pos ≤ sweep6UM * res :=
+    Nat.mul_le_mul_left _ hdist
+  have hhalf : sweep6UM ≤ 2 * nIntervals * halfStepSweepUM sweep6UM nIntervals :=
+    halfStepSweepUM_spec sweep6UM nIntervals hn
+  have hnat2 : sweep6UM * res ≤ (2 * nIntervals * halfStepSweepUM sweep6UM nIntervals) * res :=
+    Nat.mul_le_mul_right res hhalf
+  have hnat3 :
+      (2 * nIntervals * halfStepSweepUM sweep6UM nIntervals) * res =
+        (2 * nIntervals * res) * halfStepSweepUM sweep6UM nIntervals := by
+    rw [Nat.mul_assoc (2 * nIntervals) _ res, Nat.mul_comm _ res, ← Nat.mul_assoc]
+  have hprod_nat :
+      sweep6UM * natAbsDiff (2 * nearestGridIndex res pos * res) pos ≤
+        (2 * nIntervals * res) * halfStepSweepUM sweep6UM nIntervals := by omega
+  have hprod_int :
+      (sweep6UM : Int) * (natAbsDiff (2 * nearestGridIndex res pos * res) pos : Int) ≤
+        ((2 * nIntervals * res : Nat) : Int) * (halfStepSweepUM sweep6UM nIntervals : Int) := by
+    exact_mod_cast hprod_nat
+  have hmul_bound := Int.le_trans hstep1 hprod_int
+  have hdiff :=
+    int_le_of_pos_mul_le
+      ((2 * nIntervals * res : Nat) : Int)
+      (clearanceUM (2 * nearestGridIndex res pos * res) - clearanceUM pos)
+      (halfStepSweepUM sweep6UM nIntervals : Int)
+      hD_pos
+      hmul_bound
+  omega
+
+/-- Whitney (1982) two-point peg-in-hole non-wedging check (`theta < c / (mu * R_hole)`):
+    With `boreClearanceUM` (`um`), `holeRadiusUM` (`um`), `frictionMilli` (`1000 * mu`), and
+    `tiltUrad` (`10^6 * theta`), non-wedging holds when
+    `frictionMilli * holeRadiusUM * tiltUrad < 1000000000 * boreClearanceUM`. -/
+structure WhitneyNonWedgingCheck where
+  boreClearanceUM : Nat   -- e.g. 100 um (0.10 mm)
+  holeRadiusUM    : Nat   -- e.g. 3400 um (3.40 mm)
+  frictionMilli   : Nat   -- e.g. 250 (mu = 0.25)
+  tiltUrad        : Nat   -- e.g. 17453 urad (1.0 deg)
+  deriving DecidableEq, Repr
+
+def checkWhitneyNonWedging (w : WhitneyNonWedgingCheck) : Option RegimeViolation :=
+  firstViolation
+    [ (decide (0 < w.boreClearanceUM ∧ 0 < w.holeRadiusUM),
+        { repo := "lab-hands", rule := "positive_peg_hole_clearance",
+          detail := "bore clearance and hole radius must be strictly positive" }),
+      (decide (w.frictionMilli * w.holeRadiusUM * w.tiltUrad < 1000000000 * w.boreClearanceUM),
+        { repo := "lab-hands", rule := "whitney_two_point_non_wedging",
+          detail := "peg tilt exceeds Whitney wedging cone c / (mu * R_hole)" }) ]
+
+theorem checkWhitneyNonWedging_sound (w : WhitneyNonWedgingCheck)
+    (hok : checkWhitneyNonWedging w = none) :
+    0 < w.boreClearanceUM ∧
+    w.frictionMilli * w.holeRadiusUM * w.tiltUrad < 1000000000 * w.boreClearanceUM := by
+  unfold checkWhitneyNonWedging at hok
+  simp only [firstViolation_cons, firstViolation_nil, and_true, decide_eq_true_eq] at hok
+  exact ⟨hok.1.1, hok.2⟩
+
+/-- Positive 3-impulse ZV/ZVD/EI input-shaper convexity bound preservation:
+    If nonnegative impulse weights `a1 + a2 + a3 = 1000` (permille) convolve samples
+    each bounded by `v1, v2, v3 <= vMax`, the shaped output never exceeds `1000 * vMax`. -/
+theorem positiveShaper_preserves_kinematic_bound
+    (a1 a2 a3 v1 v2 v3 vMax : Nat)
+    (hsum : a1 + a2 + a3 = 1000)
+    (hv1 : v1 ≤ vMax) (hv2 : v2 ≤ vMax) (hv3 : v3 ≤ vMax) :
+    a1 * v1 + a2 * v2 + a3 * v3 ≤ 1000 * vMax := by
+  have m1 : a1 * v1 ≤ a1 * vMax := Nat.mul_le_mul_left a1 hv1
+  have m2 : a2 * v2 ≤ a2 * vMax := Nat.mul_le_mul_left a2 hv2
+  have m3 : a3 * v3 ≤ a3 * vMax := Nat.mul_le_mul_left a3 hv3
+  have hdist : (a1 + a2 + a3) * vMax = a1 * vMax + a2 * vMax + a3 * vMax := by
+    rw [Nat.add_mul, Nat.add_mul]
+  rw [hsum] at hdist
+  omega
+
+def validWhitney : WhitneyNonWedgingCheck :=
+  { boreClearanceUM := 100
+    holeRadiusUM    := 3400
+    frictionMilli   := 250
+    tiltUrad        := 26180 } -- 1.5 deg < c/(mu*R) = 100 / (0.25 * 3400) = 0.1176 rad (6.7 deg)
+
+def wedgingWhitney : WhitneyNonWedgingCheck :=
+  { boreClearanceUM := 50
+    holeRadiusUM    := 3400
+    frictionMilli   := 450
+    tiltUrad        := 43633 } -- 2.5 deg > 50 / (0.45 * 3400) = 0.03268 rad (1.87 deg) -> WEDGES!
+
+#guard checkWhitneyNonWedging validWhitney == none
+#guard (checkWhitneyNonWedging wedgingWhitney).isSome == true
 
 end LabHandsLean

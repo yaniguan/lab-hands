@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -22,8 +22,58 @@ from .labware import DeckLayout, PlateGeometry, parse_well_ref
 from .planner import ik_solutions, path_length, rrt, rrt_connect, select_ik_branch, shortcut
 
 TRAJECTORY_SCHEMA = "lab-hands/trajectory/v1"
-_GRAVITY_M_S2 = 9.80665
-_BESSEL_XI_11 = 1.841
+SLOSH_GRAVITY_M_S2 = 9.80665
+SLOSH_BESSEL_XI_11 = 1.8411837813406593
+MIN_GRAVITY_SLOSH_BOND_NUMBER = 5.0
+_GRAVITY_M_S2 = SLOSH_GRAVITY_M_S2
+_BESSEL_XI_11 = SLOSH_BESSEL_XI_11
+
+
+def slosh_natural_frequency(
+    well_radius_m: float,
+    fill_height_m: float,
+    *,
+    gravity_m_s2: float = SLOSH_GRAVITY_M_S2,
+    xi_11: float = SLOSH_BESSEL_XI_11,
+) -> float:
+    """First antisymmetric cylindrical gravity-wave natural frequency (`rad/s`):
+
+        omega_11 = sqrt((xi_11 * g / R) * tanh(xi_11 * h / R))
+
+    Single canonical dispersion implementation shared across `trajectory.py`,
+    `datasets.py`, `slosh_dynamics.py`, and `community_extensions/slosh_minimum_jerk.py`.
+    """
+    r = float(well_radius_m)
+    h = float(fill_height_m)
+    g = float(gravity_m_s2)
+    xi = float(xi_11)
+    if r <= 0.0 or h <= 0.0:
+        raise ValueError(f"well_radius_m and fill_height_m must be strictly positive, got R={r}, h={h}")
+    if g <= 0.0 or xi <= 0.0:
+        raise ValueError("gravity_m_s2 and xi_11 must be strictly positive")
+    return math.sqrt((xi * g / r) * math.tanh(xi * h / r))
+
+
+def slosh_bond_number(
+    well_radius_m: float,
+    surface_tension_n_m: float = 0.072,
+    density_kg_m3: float = 1000.0,
+    *,
+    gravity_m_s2: float = SLOSH_GRAVITY_M_S2,
+) -> float:
+    """Dimensionless Bond number `Bo = rho * g * R^2 / sigma` comparing gravity to surface tension.
+
+    A flat-surface pure-gravity linear Bessel slosh model requires `Bo >= MIN_GRAVITY_SLOSH_BOND_NUMBER`
+    (`5.0`) so gravitational restoring pressure dominates capillary meniscus curvature (`Bo ~ 1.6` for
+    water in a 96-well plate and `Bo ~ 0.44` in a 384-well plate -> `SLOSH_MODEL_OUT_OF_RANGE`).
+    """
+    r = float(well_radius_m)
+    sigma = float(surface_tension_n_m)
+    rho = float(density_kg_m3)
+    g = float(gravity_m_s2)
+    if r <= 0.0 or sigma <= 0.0 or rho <= 0.0 or g <= 0.0:
+        raise ValueError("well_radius_m, surface_tension_n_m, density_kg_m3, and gravity_m_s2 must be > 0")
+    return float(rho * g * (r * r) / sigma)
 
 
 @dataclass(frozen=True)
@@ -41,6 +91,8 @@ class TimeParameterizedTrajectory:
     max_joint_vel_rad_s: float
     max_joint_acc_rad_s2: float
     max_tip_acc_m_s2: float
+    bond_number: Optional[float] = None
+    slosh_model_status: str = "NOT_APPLICABLE"
 
 
 @dataclass(frozen=True)
@@ -191,9 +243,7 @@ def _cylindrical_slosh_peak_rise_m(
     rigid_forearm_mount: bool,
 ) -> float:
     """Integrate fundamental cylindrical slosh mode across plate offsets at candidate `duration_s`."""
-    omega_n = math.sqrt(_BESSEL_XI_11 * _GRAVITY_M_S2 / well_radius_m) * math.tanh(
-        _BESSEL_XI_11 * fill_height_m / well_radius_m
-    )
+    omega_n = slosh_natural_frequency(well_radius_m, fill_height_m)
     n_samples = q.shape[0]
     dt_s = duration_s / max(1, n_samples - 1)
     inv_t2 = 1.0 / (duration_s * duration_s)
@@ -428,6 +478,13 @@ def parameterize_path(
     qd = qd_unit / duration
     qdd = qdd_unit / (duration * duration)
     tip_xy, tip_vel, tip_acc = arm.batch_tip_kinematics(q, qd, qdd)
+    bo_val: Optional[float] = None
+    model_status = "NOT_APPLICABLE"
+    if well_radius_m is not None:
+        bo_val = round(slosh_bond_number(float(well_radius_m)), 4)
+        model_status = (
+            "IN_GRAVITY_REGIME" if bo_val >= MIN_GRAVITY_SLOSH_BOND_NUMBER else "SLOSH_MODEL_OUT_OF_RANGE"
+        )
 
     return TimeParameterizedTrajectory(
         t=t,
@@ -441,6 +498,8 @@ def parameterize_path(
         max_joint_vel_rad_s=float(np.max(np.abs(qd))),
         max_joint_acc_rad_s2=float(np.max(np.abs(qdd))),
         max_tip_acc_m_s2=float(np.max(np.linalg.norm(tip_acc, axis=-1))),
+        bond_number=bo_val,
+        slosh_model_status=model_status,
     )
 
 
@@ -666,12 +725,19 @@ def plan_3d_pick_place(
         poses_se3.append(pose)
         max_tilt = max(max_tilt, pose.tool_tilt_rad())
         if arm_se3 is not None and q6_list is not None:
-            q6 = arm_se3.ik_se3(pose, elbow=1)
-            if q6 is None:
-                q6 = arm_se3.ik_se3(pose, elbow=-1)
-            if q6 is None:
-                return None
-            q6_list.append(q6)
+            if hasattr(arm_se3, "dls_ik"):
+                prev_seed = q6_list[-1] if q6_list else None
+                ik_res = arm_se3.dls_ik(pose, q_seed=prev_seed)  # type: ignore[attr-defined]
+                if not ik_res.success:
+                    return None
+                q6_list.append(ik_res.q.copy())
+            else:
+                q6 = arm_se3.ik_se3(pose, elbow=1)
+                if q6 is None:
+                    q6 = arm_se3.ik_se3(pose, elbow=-1)
+                if q6 is None:
+                    return None
+                q6_list.append(q6)
 
     return PickPlacePlan3D(
         source_ref=source_ref,
@@ -783,3 +849,569 @@ def build_trajectory_record(
     )
     rec.validate()
     return rec
+
+
+# ---------------------------------------------------------------------------
+# Canonical HuggingFace LeRobot v2.1 / v3.0 & Opentrons 3D Gantry Interfaces
+# ---------------------------------------------------------------------------
+
+OPENTRONS_DECK_BOUNDS_MM: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
+    (0.0, 418.0),
+    (0.0, 353.0),
+    (0.0, 218.0),
+)
+
+# Exact rigid offset aligning lab_hands DeckLayout slots 1..11 (m) with Opentrons deck coordinates (mm):
+# Slot 1 A1: (0.1600, -0.1000) m <-> (14.38, 74.24) mm
+# Slot 5 A1: (0.2925, -0.0095) m <-> (146.88, 164.74) mm
+DEFAULT_DECK_ORIGIN_IN_BASE_M: Tuple[float, float, float] = (0.14562, -0.17424, 0.0)
+
+
+@dataclass(frozen=True)
+class LeRobotFrameTable:
+    """Canonical HuggingFace LeRobot v2.1 / v3.0 frame-tabular episode tensors."""
+
+    observation_state: np.ndarray  # float32 (T, D_state), e.g. (T, 7) = 6 UR5e joints + 1 gripper/plunger
+    action: np.ndarray  # float32 (T, D_action), e.g. (T, 7)
+    timestamp: np.ndarray  # float32 (T,)
+    frame_index: np.ndarray  # int64 (T,)
+    episode_index: np.ndarray  # int64 (T,)
+    next_done: np.ndarray  # bool (T,)
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.observation_state.shape[0])
+
+    @property
+    def state_dim(self) -> int:
+        return int(self.observation_state.shape[1])
+
+    @property
+    def action_dim(self) -> int:
+        return int(self.action.shape[1])
+
+    def validate(self) -> None:
+        validate_lerobot_frame_tensors(self.to_dict())
+
+    def to_dict(self) -> Dict[str, np.ndarray]:
+        return {
+            "observation.state": self.observation_state,
+            "action": self.action,
+            "timestamp": self.timestamp,
+            "frame_index": self.frame_index,
+            "episode_index": self.episode_index,
+            "next.done": self.next_done,
+        }
+
+    def to_rows(self, *, task_index: int = 0) -> List[Dict[str, Any]]:
+        self.validate()
+        rows: List[Dict[str, Any]] = []
+        for idx in range(self.n_frames):
+            rows.append(
+                {
+                    "observation.state": [float(v) for v in self.observation_state[idx]],
+                    "action": [float(v) for v in self.action[idx]],
+                    "timestamp": float(self.timestamp[idx]),
+                    "frame_index": int(self.frame_index[idx]),
+                    "episode_index": int(self.episode_index[idx]),
+                    "next.done": bool(self.next_done[idx]),
+                    "task_index": int(task_index),
+                }
+            )
+        return rows
+
+
+def validate_lerobot_frame_tensors(tensors: Mapping[str, Any]) -> None:
+    """Strictly validate canonical HuggingFace LeRobot v2.1 / v3.0 tensor keys, dtypes, and shapes."""
+    required = (
+        "observation.state",
+        "action",
+        "timestamp",
+        "frame_index",
+        "episode_index",
+        "next.done",
+    )
+    for k in required:
+        if k not in tensors:
+            raise ValueError(f"Missing canonical LeRobot tensor key {k!r}")
+        if not isinstance(tensors[k], np.ndarray):
+            raise TypeError(f"LeRobot tensor {k!r} must be a numpy.ndarray, got {type(tensors[k]).__name__}")
+
+    obs = tensors["observation.state"]
+    act = tensors["action"]
+    ts = tensors["timestamp"]
+    fidx = tensors["frame_index"]
+    eidx = tensors["episode_index"]
+    done = tensors["next.done"]
+
+    if obs.dtype != np.float32 or obs.ndim != 2 or obs.shape[0] < 1 or obs.shape[1] < 1:
+        raise ValueError(
+            f"observation.state must be float32 of shape (T, D_state), got dtype={obs.dtype}, shape={obs.shape}"
+        )
+    t_len = int(obs.shape[0])
+
+    if act.dtype != np.float32 or act.ndim != 2 or act.shape[0] != t_len or act.shape[1] < 1:
+        raise ValueError(
+            f"action must be float32 of shape ({t_len}, D_action), got dtype={act.dtype}, shape={act.shape}"
+        )
+    if ts.dtype != np.float32 or ts.shape != (t_len,):
+        raise ValueError(f"timestamp must be float32 of shape ({t_len},), got dtype={ts.dtype}, shape={ts.shape}")
+    if fidx.dtype != np.int64 or fidx.shape != (t_len,):
+        raise ValueError(
+            f"frame_index must be int64 of shape ({t_len},), got dtype={fidx.dtype}, shape={fidx.shape}"
+        )
+    if eidx.dtype != np.int64 or eidx.shape != (t_len,):
+        raise ValueError(
+            f"episode_index must be int64 of shape ({t_len},), got dtype={eidx.dtype}, shape={eidx.shape}"
+        )
+    if done.dtype != np.bool_ or done.shape != (t_len,):
+        raise ValueError(f"next.done must be bool of shape ({t_len},), got dtype={done.dtype}, shape={done.shape}")
+    if not (np.isfinite(obs).all() and np.isfinite(act).all() and np.isfinite(ts).all()):
+        raise ValueError("LeRobot float32 tensors must contain finite values")
+    if t_len >= 2 and bool(np.any(np.diff(ts) < -1e-6)):
+        raise ValueError("LeRobot timestamp tensor must be monotonically non-decreasing")
+    if not bool(done[-1]):
+        raise ValueError("LeRobot next.done[-1] must be True on terminal episode frame")
+
+
+def trajectory_to_lerobot_tensors(
+    timestamps_s: Sequence[float] | np.ndarray,
+    joint_positions_rad: Sequence[Sequence[float]] | np.ndarray,
+    *,
+    gripper_or_plunger: Optional[Sequence[float] | np.ndarray] = None,
+    actions: Optional[Sequence[Sequence[float]] | np.ndarray] = None,
+    episode_index: int = 0,
+    append_gripper_if_missing: bool = True,
+) -> LeRobotFrameTable:
+    """Convert a multi-DoF trajectory `(T, D)` into a validated `LeRobotFrameTable` (`float32`, `int64`, `bool`).
+
+    For 6-DoF UR5e trajectories `(T, 6)`, appends a 7th gripper/plunger channel by default so
+    `observation.state` and `action` have canonical shape `(T, 7)` `float32`.
+    """
+    t_arr = np.asarray(timestamps_s, dtype=np.float32)
+    q_arr = np.asarray(joint_positions_rad, dtype=np.float32)
+    if q_arr.ndim == 1:
+        q_arr = q_arr[:, None]
+    if q_arr.ndim != 2 or q_arr.shape[0] < 1:
+        raise ValueError(f"joint_positions_rad must have shape (T, D), got {q_arr.shape}")
+    n_frames = int(q_arr.shape[0])
+    if t_arr.shape != (n_frames,):
+        raise ValueError(f"timestamps_s shape {t_arr.shape} must match T={n_frames}")
+    t_arr = t_arr - float(t_arr[0])
+
+    if gripper_or_plunger is not None:
+        g_arr = np.asarray(gripper_or_plunger, dtype=np.float32).reshape(n_frames, 1)
+        obs_state = np.concatenate([q_arr, g_arr], axis=1).astype(np.float32, copy=False)
+    elif append_gripper_if_missing and q_arr.shape[1] == 6:
+        g_zero = np.zeros((n_frames, 1), dtype=np.float32)
+        obs_state = np.concatenate([q_arr, g_zero], axis=1).astype(np.float32, copy=False)
+    else:
+        obs_state = q_arr.astype(np.float32, copy=False)
+
+    if actions is not None:
+        act_arr = np.asarray(actions, dtype=np.float32)
+        if act_arr.ndim == 1:
+            act_arr = act_arr[:, None]
+        if act_arr.shape[0] != n_frames:
+            raise ValueError(f"actions length {act_arr.shape[0]} must match T={n_frames}")
+        if act_arr.shape[1] == q_arr.shape[1] and obs_state.shape[1] == q_arr.shape[1] + 1:
+            g_act = obs_state[:, -1:] if n_frames == 1 else np.vstack([obs_state[1:, -1:], obs_state[-1:, -1:]])
+            act_arr = np.concatenate([act_arr, g_act], axis=1).astype(np.float32, copy=False)
+    else:
+        # Canonical target-position action: next-step state (with terminal hold)
+        act_arr = (
+            obs_state.copy()
+            if n_frames == 1
+            else np.vstack([obs_state[1:], obs_state[-1:]]).astype(np.float32, copy=False)
+        )
+
+    frame_idx = np.arange(n_frames, dtype=np.int64)
+    ep_idx = np.full(n_frames, int(episode_index), dtype=np.int64)
+    done = np.zeros(n_frames, dtype=np.bool_)
+    done[-1] = True
+
+    return LeRobotFrameTable(
+        observation_state=obs_state,
+        action=act_arr,
+        timestamp=t_arr,
+        frame_index=frame_idx,
+        episode_index=ep_idx,
+        next_done=done,
+    )
+
+
+@dataclass(frozen=True)
+class OpentronsWaypointTrajectory:
+    """Canonical Opentrons 3D gantry + robot-base SE(3) + plunger trajectory representation."""
+
+    deck_tip_mm: np.ndarray  # float64 (T, 3) in Opentrons deck millimeters (0..418, 0..353, 0..218)
+    base_tip_m: np.ndarray  # float64 (T, 3) in robot-base SI meters
+    base_pose_se3: np.ndarray  # float64 (T, 6) [x, y, z, roll, pitch, yaw] in SI meters & radians
+    plunger_ul: np.ndarray  # float64 (T,) liquid volume held in pipette (uL >= 0)
+    timestamps_s: np.ndarray  # float64 (T,) monotonically non-decreasing seconds
+    deck_origin_in_base_m: Tuple[float, float, float] = DEFAULT_DECK_ORIGIN_IN_BASE_M
+
+    def __post_init__(self) -> None:
+        self.validate(strict_deck_bounds=True)
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.deck_tip_mm.shape[0])
+
+    def validate(self, *, strict_deck_bounds: bool = True) -> None:
+        validate_opentrons_trajectory(
+            {
+                "deck_tip_mm": self.deck_tip_mm,
+                "base_tip_m": self.base_tip_m,
+                "base_pose_se3": self.base_pose_se3,
+                "plunger_ul": self.plunger_ul,
+                "timestamps_s": self.timestamps_s,
+            },
+            deck_origin_in_base_m=self.deck_origin_in_base_m,
+            strict_deck_bounds=strict_deck_bounds,
+        )
+
+    def to_dict(self) -> Dict[str, np.ndarray]:
+        return {
+            "deck_tip_mm": self.deck_tip_mm,
+            "base_tip_m": self.base_tip_m,
+            "base_pose_se3": self.base_pose_se3,
+            "plunger_ul": self.plunger_ul,
+            "timestamps_s": self.timestamps_s,
+        }
+
+    def to_lerobot_ur5e(
+        self,
+        *,
+        arm: Optional[Any] = None,
+        episode_index: int = 0,
+        max_pipette_volume_ul: float = 300.0,
+        attached_tip_length_m: float = 0.0,
+    ) -> LeRobotFrameTable:
+        """Solve 6-DoF `UR5eArm` IK along `base_pose_se3` and pack `(T, 7)` LeRobot tensors."""
+        from .kinematics_se3 import DEFAULT_UR5E
+
+        cobot = DEFAULT_UR5E if arm is None else arm
+        qs: List[np.ndarray] = []
+        prev_q: Optional[np.ndarray] = None
+        for idx in range(self.n_frames):
+            row = self.base_pose_se3[idx]
+            pose = PoseSE3(
+                xyz=(float(row[0]), float(row[1]), float(row[2])),
+                rpy=(float(row[3]), float(row[4]), float(row[5])),
+            )
+            ik_res = cobot.dls_ik(
+                pose,
+                q_seed=prev_q,
+                attached_tip_length_m=attached_tip_length_m,
+            )
+            if not ik_res.success:
+                raise ValueError(
+                    f"UR5e IK infeasible at frame {idx}: xyz={pose.xyz}, pos_err={ik_res.pos_error_m:.5f} m"
+                )
+            qs.append(ik_res.q)
+            prev_q = ik_res.q
+
+        plunger_norm = np.clip(self.plunger_ul / max(float(max_pipette_volume_ul), 1e-6), 0.0, 1.0)
+        return trajectory_to_lerobot_tensors(
+            self.timestamps_s,
+            np.stack(qs, axis=0),
+            gripper_or_plunger=plunger_norm,
+            episode_index=episode_index,
+        )
+
+
+def validate_opentrons_trajectory(
+    data: Mapping[str, Any],
+    *,
+    deck_origin_in_base_m: Tuple[float, float, float] = DEFAULT_DECK_ORIGIN_IN_BASE_M,
+    strict_deck_bounds: bool = True,
+) -> None:
+    """Strictly verify Opentrons `(T, 3)` deck mm, `(T, 3)` SI m, `(T, 6)` SE(3), and `(T,)` plunger uL."""
+    for key in ("deck_tip_mm", "base_tip_m", "base_pose_se3", "plunger_ul", "timestamps_s"):
+        if key not in data:
+            raise ValueError(f"Missing Opentrons trajectory field {key!r}")
+        if not isinstance(data[key], np.ndarray):
+            raise TypeError(f"Opentrons field {key!r} must be numpy.ndarray, got {type(data[key]).__name__}")
+
+    deck_mm = data["deck_tip_mm"]
+    base_m = data["base_tip_m"]
+    pose6 = data["base_pose_se3"]
+    plunger = data["plunger_ul"]
+    ts = data["timestamps_s"]
+
+    if deck_mm.dtype != np.float64 or deck_mm.ndim != 2 or deck_mm.shape[1] != 3 or deck_mm.shape[0] < 1:
+        raise ValueError(
+            f"deck_tip_mm must be float64 of shape (T, 3), got dtype={deck_mm.dtype}, shape={deck_mm.shape}"
+        )
+    t_len = int(deck_mm.shape[0])
+
+    if base_m.dtype != np.float64 or base_m.shape != (t_len, 3):
+        raise ValueError(
+            f"base_tip_m must be float64 of shape ({t_len}, 3), got dtype={base_m.dtype}, shape={base_m.shape}"
+        )
+    if pose6.dtype != np.float64 or pose6.shape != (t_len, 6):
+        raise ValueError(
+            f"base_pose_se3 must be float64 of shape ({t_len}, 6), got dtype={pose6.dtype}, shape={pose6.shape}"
+        )
+    if plunger.dtype != np.float64 or plunger.shape != (t_len,):
+        raise ValueError(
+            f"plunger_ul must be float64 of shape ({t_len},), got dtype={plunger.dtype}, shape={plunger.shape}"
+        )
+    if ts.dtype != np.float64 or ts.shape != (t_len,):
+        raise ValueError(
+            f"timestamps_s must be float64 of shape ({t_len},), got dtype={ts.dtype}, shape={ts.shape}"
+        )
+
+    for arr_name, arr in (
+        ("deck_tip_mm", deck_mm),
+        ("base_tip_m", base_m),
+        ("base_pose_se3", pose6),
+        ("plunger_ul", plunger),
+        ("timestamps_s", ts),
+    ):
+        if not np.isfinite(arr).all():
+            raise ValueError(f"Opentrons field {arr_name!r} contains non-finite values")
+
+    if bool(np.any(plunger < -1e-9)):
+        raise ValueError("plunger_ul cannot be negative")
+
+    if strict_deck_bounds:
+        (x_lo, x_hi), (y_lo, y_hi), (z_lo, z_hi) = OPENTRONS_DECK_BOUNDS_MM
+        tol = 1e-6
+        if bool(
+            np.any(deck_mm[:, 0] < x_lo - tol)
+            or np.any(deck_mm[:, 0] > x_hi + tol)
+            or np.any(deck_mm[:, 1] < y_lo - tol)
+            or np.any(deck_mm[:, 1] > y_hi + tol)
+            or np.any(deck_mm[:, 2] < z_lo - tol)
+            or np.any(deck_mm[:, 2] > z_hi + tol)
+        ):
+            raise ValueError(
+                f"deck_tip_mm exceeds Opentrons deck envelope (0..418, 0..353, 0..218) mm: "
+                f"min={deck_mm.min(axis=0).round(3)}, max={deck_mm.max(axis=0).round(3)}"
+            )
+
+    origin = np.asarray(deck_origin_in_base_m, dtype=np.float64)
+    expected_base = origin[None, :] + 1e-3 * deck_mm
+    if not np.allclose(base_m, expected_base, atol=1e-6):
+        raise ValueError("base_tip_m does not match deck_origin_in_base_m + 1e-3 * deck_tip_mm")
+    if not np.allclose(pose6[:, :3], base_m, atol=1e-6):
+        raise ValueError("base_pose_se3[:, :3] must match base_tip_m")
+
+
+def plan_to_opentrons_trajectory(
+    plan: PickPlacePlan3D,
+    *,
+    aspirate_volume_ul: float = 100.0,
+    samples_per_segment: int = 12,
+    dt_s: float = 0.04,
+    deck_origin_in_base_m: Tuple[float, float, float] = DEFAULT_DECK_ORIGIN_IN_BASE_M,
+) -> OpentronsWaypointTrajectory:
+    """Convert a `PickPlacePlan3D` over deck labware into a validated `OpentronsWaypointTrajectory`."""
+    if not plan.poses_se3:
+        raise ValueError("plan.poses_se3 must be non-empty")
+    origin = np.asarray(deck_origin_in_base_m, dtype=np.float64)
+
+    tip_pts_m: List[np.ndarray] = []
+    rpy_pts: List[Tuple[float, float, float]] = []
+    vols: List[float] = []
+
+    key_tips = [p.tip_position(attached_tip_length_m=plan.attached_tip_length_m) for p in plan.poses_se3]
+    key_rpys = [p.rpy for p in plan.poses_se3]
+
+    # Clamp/project waypoints into Opentrons deck gantry workspace when converting off-deck cobot plans
+    # (e.g. legacy off-deck TUBE=(-0.05, 0.40) remaps to Slot 2 tube rack (0.2925, -0.1000) m)
+    key_tips_clamped: List[np.ndarray] = []
+    for pt in key_tips:
+        x_m, y_m, z_m = float(pt[0]), float(pt[1]), float(pt[2])
+        dx_mm = (x_m - float(origin[0])) * 1000.0
+        dy_mm = (y_m - float(origin[1])) * 1000.0
+        if dx_mm < 0.0 or dx_mm > 418.0 or dy_mm < 0.0 or dy_mm > 353.0:
+            # Map off-deck cobot pickup stand into Opentrons deck envelope
+            dx_mm = float(np.clip(dx_mm if dx_mm >= 0.0 else 146.88, 5.0, 413.0))
+            dy_mm = float(np.clip(dy_mm if dy_mm <= 353.0 else 74.24, 5.0, 348.0))
+            x_m = float(origin[0]) + 1e-3 * dx_mm
+            y_m = float(origin[1]) + 1e-3 * dy_mm
+        z_clamped = float(np.clip(z_m, float(origin[2]), float(origin[2]) + 0.218))
+        key_tips_clamped.append(np.array([x_m, y_m, z_clamped], dtype=np.float64))
+
+    n_seg = len(key_tips_clamped) - 1
+    if n_seg == 0:
+        tip_pts_m.append(key_tips_clamped[0])
+        rpy_pts.append(key_rpys[0])
+        vols.append(0.0)
+    else:
+        for s_idx in range(n_seg):
+            a_pt = key_tips_clamped[s_idx]
+            b_pt = key_tips_clamped[s_idx + 1]
+            a_rpy = np.asarray(key_rpys[s_idx], dtype=np.float64)
+            b_rpy = np.asarray(key_rpys[s_idx + 1], dtype=np.float64)
+            m_sub = max(2, int(samples_per_segment))
+            alphas = np.linspace(0.0, 1.0, m_sub, endpoint=(s_idx == n_seg - 1))
+            for al in alphas:
+                u = 3.0 * (al**2) - 2.0 * (al**3)
+                p_cur = (1.0 - u) * a_pt + u * b_pt
+                r_cur = (1.0 - u) * a_rpy + u * b_rpy
+                tip_pts_m.append(p_cur)
+                rpy_pts.append((float(r_cur[0]), float(r_cur[1]), float(r_cur[2])))
+                # Hold aspirated volume during transit segments (1 .. n_seg-1), dispense on final segment
+                if s_idx == 0:
+                    vols.append(float(aspirate_volume_ul) * float(al))
+                elif s_idx == n_seg - 1:
+                    vols.append(float(aspirate_volume_ul) * (1.0 - float(al)))
+                else:
+                    vols.append(float(aspirate_volume_ul))
+
+    base_tip_m = np.stack(tip_pts_m, axis=0).astype(np.float64)
+    deck_tip_mm = ((base_tip_m - origin[None, :]) * 1000.0).astype(np.float64)
+    rpy_arr = np.asarray(rpy_pts, dtype=np.float64)
+    base_pose_se3 = np.concatenate([base_tip_m, rpy_arr], axis=1).astype(np.float64)
+    plunger_ul = np.maximum(0.0, np.asarray(vols, dtype=np.float64))
+    timestamps_s = np.arange(base_tip_m.shape[0], dtype=np.float64) * float(dt_s)
+
+    return OpentronsWaypointTrajectory(
+        deck_tip_mm=deck_tip_mm,
+        base_tip_m=base_tip_m,
+        base_pose_se3=base_pose_se3,
+        plunger_ul=plunger_ul,
+        timestamps_s=timestamps_s,
+        deck_origin_in_base_m=deck_origin_in_base_m,
+    )
+
+
+def _extract_point_mm_from_opentrons_location(loc: Any) -> Optional[Tuple[float, float, float]]:
+    if loc is None:
+        return None
+    pt = getattr(loc, "point", None)
+    if pt is not None and hasattr(pt, "x"):
+        return (float(pt.x), float(pt.y), float(pt.z))
+    if hasattr(loc, "top"):
+        top_loc = loc.top()
+        top_pt = getattr(top_loc, "point", None)
+        if top_pt is not None:
+            return (float(top_pt.x), float(top_pt.y), float(top_pt.z))
+    lw = getattr(loc, "labware", None)
+    if lw is not None and hasattr(lw, "is_well") and bool(lw.is_well):
+        well = lw.as_well()
+        top_pt = well.top().point
+        return (float(top_pt.x), float(top_pt.y), float(top_pt.z))
+    if isinstance(loc, Mapping) and all(k in loc for k in ("x", "y", "z")):
+        return (float(loc["x"]), float(loc["y"]), float(loc["z"]))
+    if isinstance(loc, (tuple, list)) and len(loc) == 3:
+        return (float(loc[0]), float(loc[1]), float(loc[2]))
+    return None
+
+
+def extract_opentrons_runlog_trajectory(
+    runlog: Sequence[Mapping[str, Any]],
+    *,
+    safe_transit_z_mm: float = 115.0,
+    samples_per_move: int = 10,
+    dt_s: float = 0.04,
+    deck_origin_in_base_m: Tuple[float, float, float] = DEFAULT_DECK_ORIGIN_IN_BASE_M,
+) -> OpentronsWaypointTrajectory:
+    """Parse a live `opentrons.simulate.simulate()` 8.8.x runlog into `OpentronsWaypointTrajectory`.
+
+    Inserts safe Z-retract gantry arches (`safe_transit_z_mm <= 218 mm`) between distinct XY
+    wells and tracks cumulative plunger microliter volume across `aspirate` / `dispense` / `drop_tip`.
+    """
+    if not (0.0 <= safe_transit_z_mm <= 218.0):
+        raise ValueError(f"safe_transit_z_mm must be in [0, 218], got {safe_transit_z_mm}")
+
+    key_deck_mm: List[np.ndarray] = []
+    key_vol_ul: List[float] = []
+    cur_vol = 0.0
+
+    for entry in runlog:
+        payload = entry.get("payload", entry) if isinstance(entry, Mapping) else {}
+        if not isinstance(payload, Mapping):
+            continue
+        text = str(payload.get("text", "")).lower()
+        pt_mm = _extract_point_mm_from_opentrons_location(payload.get("location"))
+        if pt_mm is None:
+            pt_mm = _extract_point_mm_from_opentrons_location(payload.get("end_location"))
+        if pt_mm is None:
+            continue
+
+        cur_pt = np.array(
+            [
+                float(np.clip(pt_mm[0], 0.0, 418.0)),
+                float(np.clip(pt_mm[1], 0.0, 353.0)),
+                float(np.clip(pt_mm[2], 0.0, 218.0)),
+            ],
+            dtype=np.float64,
+        )
+
+        # Insert safe-Z retract -> XY gantry travel -> Z plunge when moving laterally between wells
+        if key_deck_mm:
+            prev_pt = key_deck_mm[-1]
+            if float(np.linalg.norm(cur_pt[:2] - prev_pt[:2])) > 0.5:
+                z_arch = min(218.0, max(float(safe_transit_z_mm), float(prev_pt[2]) + 15.0, float(cur_pt[2]) + 15.0))
+                key_deck_mm.append(np.array([prev_pt[0], prev_pt[1], z_arch], dtype=np.float64))
+                key_vol_ul.append(cur_vol)
+                key_deck_mm.append(np.array([cur_pt[0], cur_pt[1], z_arch], dtype=np.float64))
+                key_vol_ul.append(cur_vol)
+
+        vol_delta = float(payload.get("volume") or 0.0)
+        if text.startswith("aspirat"):
+            # Arrive at well at pre-aspirate volume, then draw plunger up
+            key_deck_mm.append(cur_pt)
+            key_vol_ul.append(cur_vol)
+            cur_vol = cur_vol + max(0.0, vol_delta)
+            key_deck_mm.append(cur_pt.copy())
+            key_vol_ul.append(cur_vol)
+        elif text.startswith("dispens"):
+            key_deck_mm.append(cur_pt)
+            key_vol_ul.append(cur_vol)
+            cur_vol = max(0.0, cur_vol - max(0.0, vol_delta))
+            key_deck_mm.append(cur_pt.copy())
+            key_vol_ul.append(cur_vol)
+        elif "drop" in text or "blow" in text:
+            cur_vol = 0.0
+            key_deck_mm.append(cur_pt)
+            key_vol_ul.append(0.0)
+        else:
+            key_deck_mm.append(cur_pt)
+            key_vol_ul.append(cur_vol)
+
+    if not key_deck_mm:
+        raise ValueError("Opentrons runlog contained zero spatial well/point commands")
+
+    dense_mm: List[np.ndarray] = []
+    dense_vol: List[float] = []
+    n_seg = len(key_deck_mm) - 1
+    if n_seg == 0:
+        dense_mm.append(key_deck_mm[0])
+        dense_vol.append(key_vol_ul[0])
+    else:
+        for idx in range(n_seg):
+            pa, pb = key_deck_mm[idx], key_deck_mm[idx + 1]
+            va, vb = key_vol_ul[idx], key_vol_ul[idx + 1]
+            m_sub = 2 if np.allclose(pa, pb, atol=1e-6) else max(2, int(samples_per_move))
+            alphas = np.linspace(0.0, 1.0, m_sub, endpoint=(idx == n_seg - 1))
+            for al in alphas:
+                u = 3.0 * (al**2) - 2.0 * (al**3)
+                dense_mm.append((1.0 - u) * pa + u * pb)
+                dense_vol.append((1.0 - float(al)) * va + float(al) * vb)
+
+    deck_arr = np.stack(dense_mm, axis=0).astype(np.float64)
+    origin = np.asarray(deck_origin_in_base_m, dtype=np.float64)
+    base_arr = (origin[None, :] + 1e-3 * deck_arr).astype(np.float64)
+    zeros_rpy = np.zeros((deck_arr.shape[0], 3), dtype=np.float64)
+    pose6_arr = np.concatenate([base_arr, zeros_rpy], axis=1).astype(np.float64)
+    vol_arr = np.maximum(0.0, np.asarray(dense_vol, dtype=np.float64))
+    t_arr = np.arange(deck_arr.shape[0], dtype=np.float64) * float(dt_s)
+
+    return OpentronsWaypointTrajectory(
+        deck_tip_mm=deck_arr,
+        base_tip_m=base_arr,
+        base_pose_se3=pose6_arr,
+        plunger_ul=vol_arr,
+        timestamps_s=t_arr,
+        deck_origin_in_base_m=deck_origin_in_base_m,
+    )
+

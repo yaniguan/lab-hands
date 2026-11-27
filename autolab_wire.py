@@ -2,8 +2,8 @@
 
 Bridges upstream L4 verification (`lab-verify`) to downstream L0 edge execution (`lab-feet`)
 and L4 causal attribution (`lab-attrib`) by solving continuity-aware 2-link SBS inverse
-kinematics, deterministic joint-space RRT + shortcut smoothing, certified continuous
-capsule-AABB clearance measurement, and closed-loop tactile bevel insertion with slip/seal telemetry.
+kinematics, deterministic joint-space RRT + shortcut smoothing planned to `max(5.0, clearance_mm)`,
+certified continuous capsule-AABB clearance measurement, and closed-loop tactile bevel insertion.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -48,6 +48,47 @@ INVARIANT_ID = "arm_path_collision_free_with_5mm_margin"
 MIN_CLEARANCE_MM = 5.0
 
 
+def _parse_numeric_field(
+    packet: Mapping[str, Any],
+    key: str,
+    *,
+    default: Optional[float | int] = None,
+    integer_only: bool = False,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+    strictly_positive: bool = False,
+) -> Tuple[bool, Optional[float | int], Optional[str]]:
+    """Parse and validate a numeric packet field without raising on malformed types or NaN/Inf."""
+    if key not in packet:
+        return True, default, None
+
+    raw = packet[key]
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float, np.integer, np.floating)):
+        return False, None, f"Invalid packet field {key!r}: expected finite number, got {raw!r}."
+
+    fval = float(raw)
+    if not math.isfinite(fval):
+        return False, None, f"Invalid packet field {key!r}: non-finite value {raw!r}."
+
+    if integer_only:
+        if not isinstance(raw, (int, np.integer)):
+            return False, None, f"Invalid packet field {key!r}: expected integer, got {raw!r}."
+        ival = int(raw)
+        if min_value is not None and ival < min_value:
+            return False, None, f"Invalid packet field {key!r}: {ival} < {min_value}."
+        if max_value is not None and ival > max_value:
+            return False, None, f"Invalid packet field {key!r}: {ival} > {max_value}."
+        return True, ival, None
+
+    if strictly_positive and fval <= 0.0:
+        return False, None, f"Invalid packet field {key!r}: {fval} must be > 0."
+    if min_value is not None and fval < min_value:
+        return False, None, f"Invalid packet field {key!r}: {fval} < {min_value}."
+    if max_value is not None and fval > max_value:
+        return False, None, f"Invalid packet field {key!r}: {fval} > {max_value}."
+    return True, fval, None
+
+
 def _resolve_target_xy(well_ref: object, scene: BenchScene) -> Optional[np.ndarray]:
     """Resolve an SBS well reference ('A1'..'H12', 'slot:A1', 1..N) or 'TUBE' to XY (m)."""
     try:
@@ -64,31 +105,30 @@ def _resolve_target_xy(well_ref: object, scene: BenchScene) -> Optional[np.ndarr
         return None
 
 
-def _build_arm(packet: Dict[str, Any]) -> Optional[Arm2D]:
-    raw_radius = packet.get("capsule_radius_m", 0.0)
+def _build_arm_with_margin(capsule_radius_m: float, margin_m: float) -> Optional[Arm2D]:
     try:
-        cap_r = float(raw_radius)
-        if not math.isfinite(cap_r) or cap_r < 0.0:
+        if not (math.isfinite(capsule_radius_m) and math.isfinite(margin_m)):
             return None
-        if cap_r == 0.0:
+        if capsule_radius_m < 0.0 or margin_m < 0.0:
+            return None
+        if capsule_radius_m == 0.0 and abs(margin_m - DEFAULT_ARM.margin_m) <= 1e-12:
             return DEFAULT_ARM
         return Arm2D(
             l1=DEFAULT_ARM.l1,
             l2=DEFAULT_ARM.l2,
             joint_limits=DEFAULT_ARM.joint_limits,
-            clearance_m=cap_r,
-            margin_m=DEFAULT_ARM.margin_m,
+            clearance_m=float(capsule_radius_m),
+            margin_m=float(margin_m),
         )
     except (ValueError, TypeError):
         return None
 
 
-def _build_scene(packet: Dict[str, Any]) -> Optional[BenchScene]:
+def _build_scene(packet: Dict[str, Any], attached_tip_length_m: float = 0.0) -> Optional[BenchScene]:
     """Build workspace scene from optional custom obstacles, labware load_name, and tip length."""
     custom_obstacles = packet.get("obstacles")
     load_name = packet.get("labware")
-    raw_tip_len = packet.get("attached_tip_length_m", 0.0)
-    if custom_obstacles is None and load_name is None and raw_tip_len in (0, 0.0, None):
+    if custom_obstacles is None and load_name is None and attached_tip_length_m == 0.0:
         return DEFAULT_SCENE
     try:
         boxes = (
@@ -97,11 +137,10 @@ def _build_scene(packet: Dict[str, Any]) -> Optional[BenchScene]:
             else tuple((float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in custom_obstacles)
         )
         plate = DEFAULT_SCENE.plate if load_name is None else get_plate_geometry(str(load_name))
-        tip_len = 0.0 if raw_tip_len is None else float(raw_tip_len)
         return BenchScene(
             obstacles=boxes,
             tube_xy=DEFAULT_SCENE.tube_xy,
-            attached_tip_length_m=tip_len,
+            attached_tip_length_m=float(attached_tip_length_m),
             plate=plate,
         )
     except (ValueError, TypeError, IndexError, KeyError):
@@ -151,44 +190,62 @@ def _plan_collision_free_move(
     arm: Arm2D,
     scene: BenchScene,
     start_q: Optional[Sequence[float] | np.ndarray] = None,
+    required_clearance_mm: float = MIN_CLEARANCE_MM,
 ) -> Optional[Tuple[List[np.ndarray], float]]:
-    """Solve continuity-aware 2-link IK + seeded RRT + shortcutting and return `(path, clearance_mm)`."""
-    if start_q is not None:
-        q_ref = np.asarray(start_q, dtype=np.float64)
-        if q_ref.shape != (2,) or not arm.within_joint_limits(q_ref) or in_collision(q_ref, arm=arm, scene=scene):
-            return None
-        if float(np.linalg.norm(arm.fk(q_ref)[1] - start_xy)) <= 2e-3:
-            starts = [q_ref.copy()]
+    """Solve continuity-aware 2-link IK + seeded RRT + shortcutting meeting `required_clearance_mm`."""
+    req_mm = max(MIN_CLEARANCE_MM, float(required_clearance_mm))
+    # Try a slight safety cushion first so certified `path_min_clearance` (which subtracts
+    # half-step discretization sweep) comfortably clears `req_mm`, then exact `req_mm`.
+    candidate_margins_m = [req_mm / 1000.0 + 0.0005, req_mm / 1000.0]
+    if abs(arm.margin_m - req_mm / 1000.0) <= 1e-12:
+        # Preserve exact RNG trajectory when planning directly at arm.margin_m if exact already satisfies req_mm
+        candidate_margins_m = [req_mm / 1000.0, req_mm / 1000.0 + 0.0005]
+
+    for margin_m in candidate_margins_m:
+        plan_arm = _build_arm_with_margin(arm.clearance_m, margin_m)
+        if plan_arm is None:
+            continue
+
+        if start_q is not None:
+            q_ref = np.asarray(start_q, dtype=np.float64)
+            if (
+                q_ref.shape != (2,)
+                or not plan_arm.within_joint_limits(q_ref)
+                or in_collision(q_ref, arm=plan_arm, scene=scene)
+            ):
+                continue
+            if float(np.linalg.norm(plan_arm.fk(q_ref)[1] - start_xy)) <= 2e-3:
+                starts = [q_ref.copy()]
+            else:
+                starts = ik_solutions(start_xy, arm=plan_arm, scene=scene, prev_q=q_ref)
         else:
-            starts = ik_solutions(start_xy, arm=arm, scene=scene, prev_q=q_ref)
-    else:
-        starts = ik_solutions(start_xy, arm=arm, scene=scene)
+            starts = ik_solutions(start_xy, arm=plan_arm, scene=scene)
 
-    if not starts:
-        return None
-
-    for branch_offset, q_start in enumerate(starts):
-        goals = ik_solutions(target_xy, arm=arm, scene=scene, prev_q=q_start)
-        if not goals:
-            continue
-        rng = np.random.default_rng(seed + branch_offset)
-        raw_path = rrt(q_start, goals, rng, arm=arm, scene=scene)
-        if raw_path is None:
-            raw_path = rrt_connect(q_start, goals, rng, arm=arm, scene=scene)
-        if raw_path is None:
+        if not starts:
             continue
 
-        smooth_path = shortcut(raw_path, rng, arm=arm, scene=scene)
-        if not smooth_path:
-            continue
-        if not all(arm.within_joint_limits(q) for q in smooth_path):
-            continue
-        if not all(edge_free(a, b, arm=arm, scene=scene) for a, b in zip(smooth_path, smooth_path[1:])):
-            continue
-        measured_mm = float(path_min_clearance(smooth_path, arm=arm, scene=scene) * 1000.0)
-        if measured_mm < MIN_CLEARANCE_MM - 1e-9:
-            continue
-        return smooth_path, measured_mm
+        for branch_offset, q_start in enumerate(starts):
+            goals = ik_solutions(target_xy, arm=plan_arm, scene=scene, prev_q=q_start)
+            if not goals:
+                continue
+            rng = np.random.default_rng(seed + branch_offset)
+            raw_path = rrt(q_start, goals, rng, arm=plan_arm, scene=scene)
+            if raw_path is None:
+                raw_path = rrt_connect(q_start, goals, rng, arm=plan_arm, scene=scene)
+            if raw_path is None:
+                continue
+
+            smooth_path = shortcut(raw_path, rng, arm=plan_arm, scene=scene)
+            if not smooth_path:
+                continue
+            if not all(plan_arm.within_joint_limits(q) for q in smooth_path):
+                continue
+            if not all(edge_free(a, b, arm=plan_arm, scene=scene) for a, b in zip(smooth_path, smooth_path[1:])):
+                continue
+            measured_mm = float(path_min_clearance(smooth_path, arm=plan_arm, scene=scene) * 1000.0)
+            if measured_mm < req_mm - 1e-9 or round(measured_mm, 3) < round(req_mm, 3) - 1e-9:
+                continue
+            return smooth_path, measured_mm
 
     return None
 
@@ -196,11 +253,13 @@ def _plan_collision_free_move(
 def _parse_visual_offset_m(raw_offset: Any) -> Optional[np.ndarray]:
     if raw_offset is None:
         return np.zeros(2, dtype=np.float64)
-    if isinstance(raw_offset, (int, float)) and not isinstance(raw_offset, bool):
+    if isinstance(raw_offset, (int, float, np.integer, np.floating)) and not isinstance(raw_offset, bool):
         val = float(raw_offset)
         if not math.isfinite(val):
             return None
         return np.array([val / 1000.0, 0.0], dtype=np.float64)
+    if isinstance(raw_offset, (str, bytes, dict, bool)):
+        return None
     try:
         arr = np.asarray(raw_offset, dtype=np.float64)
     except (ValueError, TypeError):
@@ -242,20 +301,69 @@ def process_packet(packet: dict) -> dict:
     raw_target = out.get("target_well", "H12")
     start_well = str(raw_start)
     target_well = str(raw_target)
-    try:
-        requested_clearance_mm = float(out.get("clearance_mm", 8.5))
-    except (ValueError, TypeError):
-        requested_clearance_mm = float("nan")
-    seed = int(out.get("seed", 0))
     require_tactile = bool(out.get("require_tactile_insert", True))
 
-    arm = _build_arm(out)
-    scene = _build_scene(out)
+    # Validate all numeric packet fields via one helper without raising
+    field_errors: List[str] = []
+    seed_ok, seed_val, seed_err = _parse_numeric_field(out, "seed", default=0, integer_only=True, min_value=0)
+    if not seed_ok and seed_err is not None:
+        field_errors.append(seed_err)
+
+    clear_ok_parse, clear_val, clear_err = _parse_numeric_field(out, "clearance_mm", default=8.5)
+    if not clear_ok_parse and clear_err is not None:
+        field_errors.append(clear_err)
+
+    cap_ok, cap_val, cap_err = _parse_numeric_field(out, "capsule_radius_m", default=0.0, min_value=0.0, max_value=0.25)
+    if not cap_ok and cap_err is not None:
+        field_errors.append(cap_err)
+
+    bevel_ok, bevel_val, bevel_err = _parse_numeric_field(
+        out, "bevel_capture_radius_m", default=None, strictly_positive=True, max_value=0.10
+    )
+    if not bevel_ok and bevel_err is not None:
+        field_errors.append(bevel_err)
+
+    tip_ok, tip_val, tip_err = _parse_numeric_field(
+        out, "attached_tip_length_m", default=0.0, min_value=0.0, max_value=0.25
+    )
+    if not tip_ok and tip_err is not None:
+        field_errors.append(tip_err)
+
+    chamfer_ok, chamfer_val, chamfer_err = _parse_numeric_field(
+        out, "chamfer_width_m", default=0.00070, strictly_positive=True, max_value=0.05
+    )
+    if not chamfer_ok and chamfer_err is not None:
+        field_errors.append(chamfer_err)
+
+    search_ok, search_val, search_err = _parse_numeric_field(
+        out, "max_search_radius_m", default=0.0045, strictly_positive=True, max_value=0.05
+    )
+    if not search_ok and search_err is not None:
+        field_errors.append(search_err)
+
+    seed = int(seed_val) if seed_val is not None else 0
+    requested_clearance_mm = float(clear_val) if clear_val is not None else float("nan")
+    capsule_radius_m = float(cap_val) if cap_val is not None else 0.0
+    attached_tip_length_m = float(tip_val) if tip_val is not None else 0.0
+    chamfer_w = float(chamfer_val) if chamfer_val is not None else 0.00070
+    max_search_r = float(search_val) if search_val is not None else 0.0045
+
+    clearance_ok = (
+        not field_errors
+        and math.isfinite(requested_clearance_mm)
+        and requested_clearance_mm >= MIN_CLEARANCE_MM
+    )
+
+    req_margin_m = max(MIN_CLEARANCE_MM, requested_clearance_mm) / 1000.0 if clearance_ok else MIN_CLEARANCE_MM / 1000.0
+    arm = None if field_errors else _build_arm_with_margin(capsule_radius_m, req_margin_m)
+    base_arm = None if field_errors else _build_arm_with_margin(capsule_radius_m, MIN_CLEARANCE_MM / 1000.0)
+    scene = None if field_errors else _build_scene(out, attached_tip_length_m=attached_tip_length_m)
+
     smooth_path: Optional[List[np.ndarray]] = None
     measured_clearance_mm: float = 0.0
+    best_measured_clearance_mm: float = 0.0
     target_xy: Optional[np.ndarray] = None
 
-    clearance_ok = math.isfinite(requested_clearance_mm) and requested_clearance_mm >= MIN_CLEARANCE_MM
     if clearance_ok and arm is not None and scene is not None:
         start_xy = _resolve_target_xy(raw_start, scene)
         target_xy = _resolve_target_xy(raw_target, scene)
@@ -269,12 +377,30 @@ def process_packet(packet: dict) -> dict:
                     arm=arm,
                     scene=scene,
                     start_q=q_init,
+                    required_clearance_mm=requested_clearance_mm,
                 )
                 if plan_res is not None:
                     smooth_path, measured_clearance_mm = plan_res
+                    best_measured_clearance_mm = measured_clearance_mm
+
+            # If no path met the requested clearance, measure best available >=5 mm path for diagnostics
+            if smooth_path is None and base_arm is not None:
+                base_valid, q_base = _parse_start_q(out, start_xy, base_arm, scene)
+                if base_valid:
+                    fallback_res = _plan_collision_free_move(
+                        start_xy,
+                        target_xy,
+                        seed=seed,
+                        arm=base_arm,
+                        scene=scene,
+                        start_q=q_base,
+                        required_clearance_mm=MIN_CLEARANCE_MM,
+                    )
+                    if fallback_res is not None:
+                        _, best_measured_clearance_mm = fallback_res
 
     tactile_payload: Optional[Dict[str, Any]] = None
-    if not clearance_ok or smooth_path is None:
+    if field_errors or not clearance_ok or smooth_path is None:
         out["halted"] = True
         out["halt_reason"] = HALT_REASON
         len_waypoints = 0
@@ -282,8 +408,8 @@ def process_packet(packet: dict) -> dict:
         collision_free = False
         reported_clearance_mm = (
             requested_clearance_mm
-            if (math.isfinite(requested_clearance_mm) and requested_clearance_mm < MIN_CLEARANCE_MM)
-            else 0.0
+            if (not field_errors and math.isfinite(requested_clearance_mm) and requested_clearance_mm < MIN_CLEARANCE_MM)
+            else round(best_measured_clearance_mm, 3)
         )
         start_q_out: Optional[List[float]] = None
         end_q_out: Optional[List[float]] = None
@@ -298,14 +424,15 @@ def process_packet(packet: dict) -> dict:
         elbow_branch = 1 if float(smooth_path[-1][1]) >= 0.0 else -1
 
         if require_tactile and target_xy is not None and arm is not None and scene is not None:
+            has_vis_key = "visual_offset_mm" in out and out["visual_offset_mm"] is not None
             offset_m = _parse_visual_offset_m(out.get("visual_offset_mm"))
-            capture_r = float(out.get("bevel_capture_radius_m", 0.0055))
             vessel = ClearVesselBevel(
                 center_xy=(float(target_xy[0]), float(target_xy[1])),
-                bore_radius_m=0.00008,
-                capture_radius_m=capture_r,
+                bore_radius_m=0.00010,
+                chamfer_width_m=chamfer_w,
+                capture_radius_m=(None if bevel_val is None else float(bevel_val)),
             )
-            if offset_m is None:
+            if has_vis_key and offset_m is None:
                 failed_ins = InsertionResult(
                     success=False,
                     initial_error_mm=0.0,
@@ -319,8 +446,9 @@ def process_packet(packet: dict) -> dict:
                 )
                 tactile_payload = _build_tactile_payload(failed_ins)
             else:
-                vis_xy = target_xy + offset_m
-                q_tactile_seed = smooth_path[-1] if float(np.linalg.norm(offset_m)) <= 1e-6 else smooth_path[-1]
+                eff_off = np.zeros(2, dtype=np.float64) if offset_m is None else offset_m
+                vis_xy = target_xy + eff_off
+                q_tactile_seed = smooth_path[-1]
                 try:
                     ins_res = run_tactile_insertion(
                         vis_xy,
@@ -329,9 +457,10 @@ def process_packet(packet: dict) -> dict:
                         arm=arm,
                         scene=scene,
                         start_q=q_tactile_seed,
+                        max_search_radius_m=max_search_r,
                     )
                 except ValueError:
-                    err_mm = float(np.linalg.norm(offset_m)) * 1000.0
+                    err_mm = float(np.linalg.norm(eff_off)) * 1000.0
                     ins_res = InsertionResult(
                         success=False,
                         initial_error_mm=err_mm,
@@ -355,8 +484,12 @@ def process_packet(packet: dict) -> dict:
         "collision_free": collision_free,
         "waypoints": len_waypoints,
         "path_length_rad": round(path_len, 4),
-        "clearance_mm": reported_clearance_mm,
-        "measured_min_clearance_mm": round(measured_clearance_mm, 3) if collision_free else 0.0,
+        "clearance_mm": reported_clearance_mm if collision_free else (
+            requested_clearance_mm
+            if (not field_errors and math.isfinite(requested_clearance_mm) and requested_clearance_mm < MIN_CLEARANCE_MM)
+            else 0.0
+        ),
+        "measured_min_clearance_mm": round(measured_clearance_mm, 3) if collision_free else round(best_measured_clearance_mm, 3),
         "requested_min_clearance_mm": (
             round(requested_clearance_mm, 3) if math.isfinite(requested_clearance_mm) else 0.0
         ),
@@ -369,7 +502,9 @@ def process_packet(packet: dict) -> dict:
     out["manipulation"] = manip_dict
 
     status = "BLOCK" if out["halted"] else "PASS"
-    if out["halted"] and out["halt_reason"] == TACTILE_HALT_REASON and tactile_payload is not None:
+    if field_errors:
+        summary = f"Blocked packet validation: {' '.join(field_errors)}"
+    elif out["halted"] and out["halt_reason"] == TACTILE_HALT_REASON and tactile_payload is not None:
         summary = (
             f"Blocked tactile insertion at {target_well}: "
             f"final_error_mm={tactile_payload['final_error_mm']}, "
@@ -377,15 +512,19 @@ def process_packet(packet: dict) -> dict:
             f"seal_intact={tactile_payload['seal_intact']} (EXECUTION_ARTIFACT)."
         )
     elif out["halted"]:
+        req_str = f"{round(requested_clearance_mm, 3)}" if math.isfinite(requested_clearance_mm) else "invalid"
         summary = (
             f"Blocked manipulation {start_well} -> {target_well}: "
-            f"clearance_mm={out['manipulation']['clearance_mm']} (< 5.0 mm) or no collision-free IK/RRT path."
+            f"requested_clearance_mm={req_str}, "
+            f"best_measured_clearance_mm={round(best_measured_clearance_mm, 3)} "
+            f"(< max(5.0, requested) or no collision-free IK/RRT path)."
         )
     else:
         summary = (
             f"Planned collision-free 2-link RRT+shortcut path {start_well} -> {target_well} "
             f"({len_waypoints} waypoints, {round(path_len, 4)} rad, "
-            f"measured clearance {round(measured_clearance_mm, 3)} mm >= 5.0 mm)."
+            f"measured clearance {round(measured_clearance_mm, 3)} mm >= "
+            f"requested {round(requested_clearance_mm, 3)} mm)."
         )
 
     out["trace"].append(
@@ -403,8 +542,8 @@ def process_packet(packet: dict) -> dict:
             "invariant": INVARIANT_ID,
             "first_principles": (
                 "Analytical 2-link SBS 96-well inverse kinematics (|q2| <= 2.60 rad), Lipschitz-certified "
-                "continuous capsule-AABB clearance checking (>= 5.0 mm margin), and closed-loop tactile "
-                "shear compliance verify collision-free transport and tip-seal seating before actuation."
+                "continuous capsule-AABB clearance checking (>= max(5.0 mm, requested_clearance_mm)), and "
+                "closed-loop tactile compliance verify collision-free transport and tip-seal seating."
             ),
         }
     )

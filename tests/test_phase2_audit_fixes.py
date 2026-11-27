@@ -178,10 +178,11 @@ def test_tactile_insertion_obstacle_and_rim_hangup_guards_issue_30() -> None:
     assert ins_blocked.slip_detected is True
 
 
-# --- Issue #31: Per-labware Z-rim, attached-tip lift clearance, and 6-DOF SE(3) kinematics ---
-def test_falcon_120mm_rim_and_all_24_stepbot_labware_3d_transfers_issue_31() -> None:
+# --- Issue #31 & #34: Official Opentrons Z-rim, well bottom, tip length, and 6-DOF SE(3) ---
+def test_falcon_124mm_rim_and_all_24_stepbot_labware_3d_transfers_issue_31_34() -> None:
     falcon = get_plate_geometry("opentrons_15_tuberack_falcon_15ml_conical")
-    assert falcon.z_rim_m == pytest.approx(0.120)
+    assert falcon.z_rim_m == pytest.approx(0.12435, abs=1e-5)
+    assert falcon.z_bottom_m == pytest.approx(0.00685, abs=1e-5)
     scene_falcon = BenchScene(plate=falcon)
     assert scene_falcon.z_safe_travel > falcon.z_rim_m
 
@@ -215,7 +216,7 @@ def test_falcon_120mm_rim_and_all_24_stepbot_labware_3d_transfers_issue_31() -> 
         assert all(wp[2] > geom.z_rim_m for wp in tr[1:-1])
 
 
-def test_se3_kinematics_attached_1000ul_tip_and_verticality_guard_issue_31() -> None:
+def test_se3_kinematics_attached_1000ul_tip_and_verticality_guard_issue_31_34() -> None:
     # 6R ArmSE3 closed-form FK/IK round-trip across tilted and vertical poses
     arm6 = ArmSE3()
     target_pose = PoseSE3(xyz=(0.24, 0.04, 0.22), rpy=(0.01, -0.01, 0.35))
@@ -224,8 +225,9 @@ def test_se3_kinematics_attached_1000ul_tip_and_verticality_guard_issue_31() -> 
     recovered = arm6.fk_se3(q6)
     assert np.allclose(recovered.homogeneous_matrix(), target_pose.homogeneous_matrix(), atol=1e-9)
 
-    # Multi-labware deck: pick up 1000 uL filter tip (L_tip = 95 mm, z_rim = 85 mm) and dispense
-    # into 2 mL deep-well block (z_rim = 42 mm) with Falcon rack (z_rim = 120 mm) also on deck!
+    # Multi-labware deck: pick up 1000 uL filter tip (tipLength - tipOverlap = 88 - 7.95 = 80.05 mm,
+    # z_rim = 97.47 mm) and dispense into 2 mL deep-well block (z_rim = 41.0 mm) with Falcon rack
+    # (z_rim = 124.35 mm) also on deck!
     deck = DeckLayout()
     deck.add_labware("tips1000", "opentrons_96_filtertiprack_1000ul", slot=4)
     deck.add_labware("deep96", "nest_96_wellplate_2ml_deep", slot=5)
@@ -243,9 +245,9 @@ def test_se3_kinematics_attached_1000ul_tip_and_verticality_guard_issue_31() -> 
     )
     assert plan is not None
     assert plan.collision_free is True
-    assert plan.attached_tip_length_m == pytest.approx(0.095)
-    # Must clear tallest deck labware (120 mm Falcon) + 95 mm mounted tip = 215 mm + margin!
-    assert plan.z_safe_transit_m >= 0.120 + 0.095 + 0.005
+    assert plan.attached_tip_length_m == pytest.approx(0.08005, abs=1e-5)
+    # Must clear tallest deck labware (124.35 mm Falcon) + 80.05 mm mounted tip = 204.40 mm + margin!
+    assert plan.z_safe_transit_m >= 0.12435 + 0.08005 + 0.005
     assert plan.z_safe_transit_m <= scene_deck.z_max
     assert plan.q6_waypoints is not None and len(plan.q6_waypoints) == len(plan.waypoints_3d)
     assert plan.max_tool_tilt_rad == pytest.approx(0.0, abs=1e-12)

@@ -1,14 +1,22 @@
-"""ANSI/SLAS (SBS) microplate geometries and stepbot-compatible 24-labware catalog."""
+"""ANSI/SLAS (SBS) microplate geometries and Opentrons-synced 24-labware catalog."""
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
 _WELL_RE = re.compile(r"^([A-Z]+)([1-9]\d*)$")
+
+OPENTRONS_LABWARE_V1_PATH = Path(__file__).resolve().parent / "data" / "opentrons_labware_v1.json"
+OPENTRONS_LABWARE_V1_BUNDLE: Dict[str, Any] = json.loads(
+    OPENTRONS_LABWARE_V1_PATH.read_text(encoding="utf-8")
+)
+OPENTRONS_LABWARE_V1: Dict[str, Dict[str, Any]] = OPENTRONS_LABWARE_V1_BUNDLE["labware"]
 
 
 def _row_label(idx: int) -> str:
@@ -38,10 +46,12 @@ class PlateGeometry:
     load_name: str = "corning_96_wellplate_360ul_flat"
     max_volume_ul: float = 360.0
     is_tiprack: bool = False
-    z_bottom_m: float = 0.005
-    z_rim_m: float = 0.015
-    well_radius_m: float = 0.0034
+    z_bottom_m: float = 0.00355
+    z_rim_m: float = 0.01422
+    well_radius_m: float = 0.00343
     custom_well_offsets: Optional[Mapping[str, Tuple[float, float]]] = field(default=None)
+    tip_length_m: float = 0.0
+    tip_overlap_m: float = 0.0
 
     def __post_init__(self) -> None:
         if self.rows < 1 or self.cols < 1:
@@ -131,14 +141,18 @@ class PlateGeometry:
         return (px_min, px_max, py_min, py_max)
 
     def default_tip_length_m(self) -> float:
-        """Nominal disposable pipette tip length (m) when picking up from a tiprack."""
+        """Mounted pipette tip overhang `tipLength - tipOverlap` (m) from Opentrons tiprack definitions."""
         if not self.is_tiprack:
             return 0.0
-        if self.max_volume_ul >= 1000.0:
-            return 0.095
-        if self.max_volume_ul >= 200.0:
-            return 0.058
-        return 0.046
+        if self.tip_length_m > 0.0:
+            return round(max(0.0, float(self.tip_length_m) - float(self.tip_overlap_m)), 6)
+        entry = OPENTRONS_LABWARE_V1.get(self.load_name)
+        if entry is not None and entry.get("isTiprack"):
+            return round(
+                max(0.0, float(entry["tipLength_mm"]) - float(entry["tipOverlap_mm"])) / 1000.0,
+                6,
+            )
+        return round(max(0.0, float(self.z_rim_m - self.z_bottom_m) - 0.0075), 6)
 
     def with_origin(self, origin_xy: Tuple[float, float]) -> "PlateGeometry":
         return PlateGeometry(
@@ -154,10 +168,45 @@ class PlateGeometry:
             z_rim_m=self.z_rim_m,
             well_radius_m=self.well_radius_m,
             custom_well_offsets=self.custom_well_offsets,
+            tip_length_m=self.tip_length_m,
+            tip_overlap_m=self.tip_overlap_m,
         )
 
 
-DEFAULT_PLATE_96 = PlateGeometry()
+def _spec_from_opentrons_v1(
+    rows: int,
+    cols: int,
+    pitch_x: float,
+    pitch_y: float,
+    origin_xy: Tuple[float, float],
+    load_name: str,
+    max_volume_ul: float,
+    *,
+    custom_well_offsets: Optional[Mapping[str, Tuple[float, float]]] = None,
+) -> PlateGeometry:
+    entry = OPENTRONS_LABWARE_V1[load_name]
+    is_tiprack = bool(entry["isTiprack"])
+    z_rim_m = round(float(entry["zDimension_mm"]) / 1000.0, 6)
+    z_bottom_m = round(float(entry["a1"]["z_mm"]) / 1000.0, 6)
+    well_radius_m = round(float(entry["well_radius_mm"]) / 1000.0, 6)
+    tip_length_m = round(float(entry.get("tipLength_mm", 0.0)) / 1000.0, 6) if is_tiprack else 0.0
+    tip_overlap_m = round(float(entry.get("tipOverlap_mm", 0.0)) / 1000.0, 6) if is_tiprack else 0.0
+    return PlateGeometry(
+        rows=rows,
+        cols=cols,
+        pitch_x=pitch_x,
+        pitch_y=pitch_y,
+        origin_xy=origin_xy,
+        load_name=load_name,
+        max_volume_ul=max_volume_ul,
+        is_tiprack=is_tiprack,
+        z_bottom_m=z_bottom_m,
+        z_rim_m=z_rim_m,
+        well_radius_m=well_radius_m,
+        custom_well_offsets=custom_well_offsets,
+        tip_length_m=tip_length_m,
+        tip_overlap_m=tip_overlap_m,
+    )
 
 
 def _build_falcon_4x50_6x15(origin_xy: Tuple[float, float] = (0.20, 0.05)) -> PlateGeometry:
@@ -174,51 +223,52 @@ def _build_falcon_4x50_6x15(origin_xy: Tuple[float, float] = (0.20, 0.05)) -> Pl
         "A4": (0.090, -0.0075),
         "B4": (0.090, -0.0425),
     }
-    return PlateGeometry(
-        rows=3,
-        cols=4,
-        pitch_x=0.025,
-        pitch_y=0.025,
-        origin_xy=origin_xy,
-        load_name="opentrons_10_tuberack_falcon_4x50ml_6x15ml_conical",
-        max_volume_ul=15000.0,
-        z_bottom_m=0.005,
-        z_rim_m=0.120,
-        well_radius_m=0.0075,
+    return _spec_from_opentrons_v1(
+        3,
+        4,
+        0.025,
+        0.025,
+        origin_xy,
+        "opentrons_10_tuberack_falcon_4x50ml_6x15ml_conical",
+        15000.0,
         custom_well_offsets=offsets,
     )
 
 
-# Complete 24-entry labware catalog aligned 1-to-1 with stepbot/src/stepbot/catalog.py
+# 24 load names and XY grids match stepbot/src/stepbot/catalog.py; z_rim_m (zDimension),
+# z_bottom_m (A1 z), well_radius_m, and tiprack tipLength/tipOverlap come from official
+# Opentrons definitions (opentrons-shared-data v1, Apache-2.0) in lab_hands/data/opentrons_labware_v1.json.
 STEPBOT_LABWARE_CATALOG: Dict[str, PlateGeometry] = {
     spec.load_name: spec
     for spec in [
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "corning_96_wellplate_360ul_flat", 360.0, False, 0.005, 0.015, 0.0034),
-        PlateGeometry(16, 24, 0.0045, 0.0045, (0.20, 0.05), "corning_384_wellplate_112ul_flat", 112.0, False, 0.005, 0.015, 0.0018),
-        PlateGeometry(4, 6, 0.0193, 0.0193, (0.20, 0.05), "corning_24_wellplate_3.4ml_flat", 3400.0, False, 0.005, 0.020, 0.0081),
-        PlateGeometry(3, 4, 0.026, 0.026, (0.20, 0.05), "corning_12_wellplate_6.9ml_flat", 6900.0, False, 0.005, 0.020, 0.0110),
-        PlateGeometry(2, 3, 0.03912, 0.03912, (0.20, 0.05), "corning_6_wellplate_16.8ml_flat", 16800.0, False, 0.005, 0.020, 0.0174),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "nest_96_wellplate_200ul_flat", 200.0, False, 0.005, 0.015, 0.0033),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "nest_96_wellplate_100ul_pcr_full_skirt", 100.0, False, 0.005, 0.021, 0.0027),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "nest_96_wellplate_2ml_deep", 2000.0, False, 0.005, 0.042, 0.0041),
-        PlateGeometry(1, 12, 0.009, 0.009, (0.20, 0.05), "nest_12_reservoir_15ml", 15000.0, False, 0.005, 0.032, 0.0040),
-        PlateGeometry(1, 1, 0.0, 0.0, (0.25, 0.02), "nest_1_reservoir_195ml", 195000.0, False, 0.005, 0.040, 0.0350),
-        PlateGeometry(1, 12, 0.009, 0.009, (0.20, 0.05), "usascientific_12_reservoir_22ml", 22000.0, False, 0.005, 0.044, 0.0040),
-        PlateGeometry(1, 1, 0.0, 0.0, (0.25, 0.02), "agilent_1_reservoir_290ml", 290000.0, False, 0.005, 0.044, 0.0350),
-        PlateGeometry(4, 6, 0.01989, 0.01928, (0.20, 0.05), "opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap", 1500.0, False, 0.010, 0.075, 0.0045),
-        PlateGeometry(4, 6, 0.01989, 0.01928, (0.20, 0.05), "opentrons_24_tuberack_nest_1.5ml_snapcap", 1500.0, False, 0.010, 0.075, 0.0045),
-        PlateGeometry(3, 5, 0.025, 0.025, (0.20, 0.05), "opentrons_15_tuberack_falcon_15ml_conical", 15000.0, False, 0.008, 0.120, 0.0075),
-        PlateGeometry(2, 3, 0.035, 0.035, (0.20, 0.05), "opentrons_6_tuberack_falcon_50ml_conical", 50000.0, False, 0.008, 0.120, 0.0135),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "corning_96_wellplate_360ul_flat", 360.0),
+        _spec_from_opentrons_v1(16, 24, 0.0045, 0.0045, (0.20, 0.05), "corning_384_wellplate_112ul_flat", 112.0),
+        _spec_from_opentrons_v1(4, 6, 0.0193, 0.0193, (0.20, 0.05), "corning_24_wellplate_3.4ml_flat", 3400.0),
+        _spec_from_opentrons_v1(3, 4, 0.026, 0.026, (0.20, 0.05), "corning_12_wellplate_6.9ml_flat", 6900.0),
+        _spec_from_opentrons_v1(2, 3, 0.03912, 0.03912, (0.20, 0.05), "corning_6_wellplate_16.8ml_flat", 16800.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "nest_96_wellplate_200ul_flat", 200.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "nest_96_wellplate_100ul_pcr_full_skirt", 100.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "nest_96_wellplate_2ml_deep", 2000.0),
+        _spec_from_opentrons_v1(1, 12, 0.009, 0.009, (0.20, 0.05), "nest_12_reservoir_15ml", 15000.0),
+        _spec_from_opentrons_v1(1, 1, 0.0, 0.0, (0.25, 0.02), "nest_1_reservoir_195ml", 195000.0),
+        _spec_from_opentrons_v1(1, 12, 0.009, 0.009, (0.20, 0.05), "usascientific_12_reservoir_22ml", 22000.0),
+        _spec_from_opentrons_v1(1, 1, 0.0, 0.0, (0.25, 0.02), "agilent_1_reservoir_290ml", 290000.0),
+        _spec_from_opentrons_v1(4, 6, 0.01989, 0.01928, (0.20, 0.05), "opentrons_24_tuberack_eppendorf_1.5ml_safelock_snapcap", 1500.0),
+        _spec_from_opentrons_v1(4, 6, 0.01989, 0.01928, (0.20, 0.05), "opentrons_24_tuberack_nest_1.5ml_snapcap", 1500.0),
+        _spec_from_opentrons_v1(3, 5, 0.025, 0.025, (0.20, 0.05), "opentrons_15_tuberack_falcon_15ml_conical", 15000.0),
+        _spec_from_opentrons_v1(2, 3, 0.035, 0.035, (0.20, 0.05), "opentrons_6_tuberack_falcon_50ml_conical", 50000.0),
         _build_falcon_4x50_6x15(),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_300ul", 300.0, True, 0.010, 0.065, 0.0030),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_20ul", 20.0, True, 0.010, 0.060, 0.0025),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_10ul", 10.0, True, 0.010, 0.060, 0.0025),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_1000ul", 1000.0, True, 0.010, 0.085, 0.0040),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_filtertiprack_200ul", 200.0, True, 0.010, 0.065, 0.0030),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_filtertiprack_20ul", 20.0, True, 0.010, 0.060, 0.0025),
-        PlateGeometry(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_filtertiprack_1000ul", 1000.0, True, 0.010, 0.085, 0.0040),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_300ul", 300.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_20ul", 20.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_10ul", 10.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_tiprack_1000ul", 1000.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_filtertiprack_200ul", 200.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_filtertiprack_20ul", 20.0),
+        _spec_from_opentrons_v1(8, 12, 0.009, 0.009, (0.20, 0.05), "opentrons_96_filtertiprack_1000ul", 1000.0),
     ]
 }
+
+DEFAULT_PLATE_96 = STEPBOT_LABWARE_CATALOG["corning_96_wellplate_360ul_flat"]
 
 # Standard ANSI/SLAS SBS slot spacing (132.5 mm x 90.5 mm slot pitch)
 DEFAULT_SLOT_ORIGINS: Dict[int, Tuple[float, float]] = {

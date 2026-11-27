@@ -1,31 +1,45 @@
 """Idea #19: Open-Meniscus Pendulum-Slosh Minimum-Jerk Trajectory Time-Scaler.
 
 Inspired by UniCT-ARSLab/DMDTE and high-speed open-plate cobot transport threads.
-Models each open 96-well meniscus via its fundamental cylindrical slosh mode:
-    omega_n = sqrt(1.841 * g / R) * tanh(1.841 * h / R)
+Models each open 96-well meniscus via its fundamental cylindrical gravity-slosh mode:
+    omega_n = sqrt((xi_11 * g / R) * tanh(xi_11 * h / R))
 with fill headspace `h_free = H_well - h`, accounting for rigid-plate rotational
 Euler tangential (`alpha_12 x r_well`) and centripetal (`-omega_12^2 * r_well`)
 accelerations across all outer corner wells (`A1`, `A12`, `H1`, `H12`), and solves
 for the minimal trajectory duration `T*` under a 5th-order minimum-jerk law
     s(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5
-so worst-case meniscus rise stays strictly below `0.7 * h_free` (`0` spills)
-while maintaining `>= 5 mm` exact continuous capsule-AABB obstacle clearance on a
-planar 2-link laboratory arm (`L1 = 0.30 m`, `L2 = 0.25 m`, `|q2| <= 2.60 rad`).
+so the predicted surrogate meniscus rise stays strictly below `0.7 * h_free`
+(with Bond-number capillary applicability flagged via `SLOSH_MODEL_OUT_OF_RANGE`
+when `Bo < 5.0`) while maintaining `>= 5 mm` exact continuous capsule-AABB
+obstacle clearance on a planar 2-link laboratory arm (`L1 = 0.30 m`, `L2 = 0.25 m`).
 """
 
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from lab_hands.collision import BenchScene, batch_min_clearance, min_clearance, path_min_clearance
 from lab_hands.kinematics import Arm2D, wrap_angle
+from lab_hands.trajectory import (
+    MIN_GRAVITY_SLOSH_BOND_NUMBER,
+    SLOSH_BESSEL_XI_11,
+    SLOSH_GRAVITY_M_S2,
+    slosh_bond_number,
+    slosh_natural_frequency,
+)
 
-GRAVITY_M_S2: float = 9.80665
-BESSEL_XI_11: float = 1.841
+GRAVITY_M_S2: float = SLOSH_GRAVITY_M_S2
+BESSEL_XI_11: float = SLOSH_BESSEL_XI_11
 LINK_1_M: float = 0.30
 LINK_2_M: float = 0.25
 MAX_ABS_Q2_RAD: float = 2.60
@@ -92,17 +106,16 @@ class SloshTrajectoryResult:
     peak_lateral_accel_m_s2: float
     min_obstacle_clearance_mm: float
     max_abs_q2_rad: float
+    bond_number: float = 0.0
+    slosh_model_status: str = "SLOSH_MODEL_OUT_OF_RANGE"
 
 
 def compute_fundamental_slosh_omega(well_radius_m: float, fill_height_m: float) -> float:
-    """Fundamental cylindrical antisymmetric slosh frequency `omega_n` (`rad/s`):
+    """Fundamental cylindrical antisymmetric gravity-slosh frequency `omega_n` (`rad/s`):
 
-        omega_n = sqrt(1.841 * g / R) * tanh(1.841 * h / R)
+        omega_n = sqrt((xi_11 * g / R) * tanh(xi_11 * h / R))
     """
-    if well_radius_m <= 0.0 or fill_height_m <= 0.0:
-        raise ValueError("well_radius_m and fill_height_m must be strictly positive")
-    arg = BESSEL_XI_11 * fill_height_m / well_radius_m
-    return float(np.sqrt(BESSEL_XI_11 * GRAVITY_M_S2 / well_radius_m) * np.tanh(arg))
+    return slosh_natural_frequency(well_radius_m, fill_height_m)
 
 
 def _fk_positions(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -446,6 +459,8 @@ def plan_unscaled_trapezoidal(
     clear_mm = _trajectory_min_clearance_mm(q_traj)
     peak_lat_acc = float(np.max(np.linalg.norm(well_accels, axis=-1)))
 
+    bo = round(slosh_bond_number(plate.well_radius_m), 4)
+    status = "IN_GRAVITY_REGIME" if bo >= MIN_GRAVITY_SLOSH_BOND_NUMBER else "SLOSH_MODEL_OUT_OF_RANGE"
     return SloshTrajectoryResult(
         method="unscaled_trapezoidal",
         duration_s=round(duration_s, 4),
@@ -457,6 +472,8 @@ def plan_unscaled_trapezoidal(
         peak_lateral_accel_m_s2=round(peak_lat_acc, 4),
         min_obstacle_clearance_mm=round(clear_mm, 4),
         max_abs_q2_rad=round(float(np.max(np.abs(q_traj[:, 1]))), 4),
+        bond_number=bo,
+        slosh_model_status=status,
     )
 
 
@@ -523,6 +540,8 @@ def plan_slosh_bounded_min_jerk(
     ratio = peak_rise_m / h_free_m
     peak_lat_acc = float(np.max(np.linalg.norm(well_accels, axis=-1)))
 
+    bo = round(slosh_bond_number(plate.well_radius_m), 4)
+    status = "IN_GRAVITY_REGIME" if bo >= MIN_GRAVITY_SLOSH_BOND_NUMBER else "SLOSH_MODEL_OUT_OF_RANGE"
     return SloshTrajectoryResult(
         method="slosh_bounded_min_jerk",
         duration_s=round(t_star, 4),
@@ -534,14 +553,16 @@ def plan_slosh_bounded_min_jerk(
         peak_lateral_accel_m_s2=round(peak_lat_acc, 4),
         min_obstacle_clearance_mm=round(clear_mm, 4),
         max_abs_q2_rad=round(float(np.max(np.abs(q_traj[:, 1]))), 4),
+        bond_number=bo,
+        slosh_model_status=status,
     )
 
 
 def run_benchmark(seed: int = 20261123) -> dict[str, Any]:
     """Benchmark 60 open-96-well plate transport tasks around benchtop obstacles.
 
-    Compares `unscaled_trapezoidal` vs `slosh_bounded_min_jerk`, reporting
-    `well_spill_rate_pct` and `mean_transport_time_sec` across all plate corner wells.
+    Compares `unscaled_trapezoidal` vs `slosh_bounded_min_jerk`, reporting predicted
+    surrogate spill rate, Bond number (`Bo = rho*g*R^2/sigma`), and `slosh_model_status`.
     """
     rng = np.random.default_rng(seed)
     n_tasks = 60
@@ -554,6 +575,8 @@ def run_benchmark(seed: int = 20261123) -> dict[str, Any]:
     mj_times: list[float] = []
     mj_ratios: list[float] = []
     mj_clearances: list[float] = []
+    last_bo = round(slosh_bond_number(0.00345), 4)
+    last_status = "IN_GRAVITY_REGIME" if last_bo >= MIN_GRAVITY_SLOSH_BOND_NUMBER else "SLOSH_MODEL_OUT_OF_RANGE"
 
     for _ in range(n_tasks):
         start_xy = (float(rng.uniform(-0.09, 0.02)), float(rng.uniform(0.36, 0.44)))
@@ -573,10 +596,14 @@ def run_benchmark(seed: int = 20261123) -> dict[str, Any]:
         mj_times.append(mj_res.duration_s)
         mj_ratios.append(mj_res.meniscus_to_headspace_ratio)
         mj_clearances.append(mj_res.min_obstacle_clearance_mm)
+        last_bo = mj_res.bond_number
+        last_status = mj_res.slosh_model_status
 
     return {
         "idea_id": "idea_19_open_meniscus_slosh_min_jerk",
         "n_tasks": n_tasks,
+        "bond_number": last_bo,
+        "slosh_model_status": last_status,
         "min_obstacle_clearance_mm": round(min(mj_clearances), 4),
         "unscaled_trapezoidal": {
             "well_spill_rate_pct": round(100.0 * trap_spills / n_tasks, 4),

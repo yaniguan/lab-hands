@@ -8,8 +8,18 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from .collision import DEFAULT_SCENE, BenchScene, edge_free, in_collision
-from .kinematics import DEFAULT_ARM, Arm2D
+from .collision import (
+    DEFAULT_SCENE,
+    DEFAULT_SCENE_3D,
+    BenchScene,
+    BenchScene3D,
+    edge_free,
+    edge_free_se3,
+    in_collision,
+    in_collision_se3,
+    path_min_clearance_se3,
+)
+from .kinematics import DEFAULT_ARM, Arm2D, PoseSE3
 from .labware import DeckLayout, PlateGeometry
 
 GoalInput = Union[np.ndarray, Sequence[float], Sequence[np.ndarray]]
@@ -531,3 +541,537 @@ def plan_well_tour(
         total_path_length_rad=path_length(waypoints),
         elbow_flips=flips,
     )
+
+
+# ---------------------------------------------------------------------------
+# Full N-DoF (6-DoF UR5e / 7-DoF Panda / 2-DoF) RRT-Connect & Informed RRT*
+# ---------------------------------------------------------------------------
+
+
+class _TreeND:
+    """Dimension-agnostic RRT tree supporting arbitrary D-DoF joint spaces."""
+
+    def __init__(self, roots: Sequence[np.ndarray], dof: int, capacity: int):
+        self.dof = int(dof)
+        self.nodes: List[np.ndarray] = [np.asarray(r, dtype=np.float64).copy() for r in roots]
+        self.parent: List[int] = [-1] * len(roots)
+        self.arr = np.zeros((max(16, capacity + len(roots) + 4), self.dof), dtype=np.float64)
+        for idx, r in enumerate(self.nodes):
+            self.arr[idx] = r
+
+    def nearest(self, x: np.ndarray) -> int:
+        diffs = self.arr[: len(self.nodes)] - x[None, :]
+        return int(np.argmin(np.einsum("ij,ij->i", diffs, diffs)))
+
+    def append(self, q: np.ndarray, parent_idx: int) -> int:
+        idx = len(self.nodes)
+        if idx >= len(self.arr):
+            grown = np.zeros((len(self.arr) * 2, self.dof), dtype=np.float64)
+            grown[:idx] = self.arr[:idx]
+            self.arr = grown
+        self.arr[idx] = q
+        self.nodes.append(q)
+        self.parent.append(parent_idx)
+        return idx
+
+
+def _extend_tree_nd(
+    tree: _TreeND,
+    target: np.ndarray,
+    step: float,
+    edge_ok_fn,
+) -> Tuple[str, int]:
+    near_idx = tree.nearest(target)
+    d = target - tree.nodes[near_idx]
+    norm_d = float(np.linalg.norm(d))
+    if norm_d < 1e-9:
+        return "reached", near_idx
+    if norm_d <= step:
+        q_new = target.copy()
+        reached = True
+    else:
+        q_new = tree.nodes[near_idx] + d * (step / norm_d)
+        reached = False
+    if not edge_ok_fn(tree.nodes[near_idx], q_new):
+        return "trapped", near_idx
+    new_idx = tree.append(q_new, near_idx)
+    return ("reached" if reached else "advanced"), new_idx
+
+
+def _connect_tree_nd(
+    tree: _TreeND,
+    target: np.ndarray,
+    step: float,
+    edge_ok_fn,
+) -> Tuple[str, int]:
+    while True:
+        status, idx = _extend_tree_nd(tree, target, step=step, edge_ok_fn=edge_ok_fn)
+        if status != "advanced":
+            return status, idx
+
+
+def rrt_connect_se3(
+    start_q: Sequence[float] | np.ndarray,
+    goal_q: Sequence[float] | np.ndarray | Sequence[np.ndarray],
+    rng: np.random.Generator,
+    *,
+    arm: object,
+    scene_3d: BenchScene3D = DEFAULT_SCENE_3D,
+    iters: int = 2000,
+    step: float = 0.35,
+    attached_tip_length_m: Optional[float] = None,
+) -> Optional[List[np.ndarray]]:
+    """Bidirectional RRT-Connect in full 6-DoF / 7-DoF SE(3) cobot joint space."""
+    q_s = np.asarray(start_q, dtype=np.float64)
+    dof = int(getattr(arm, "dof", q_s.size))
+    if q_s.shape != (dof,):
+        return None
+    if in_collision_se3(q_s, arm, scene_3d, attached_tip_length_m=attached_tip_length_m):
+        return None
+
+    if isinstance(goal_q, np.ndarray):
+        raw_goals = [goal_q] if goal_q.ndim == 1 else [goal_q[i] for i in range(len(goal_q))]
+    elif isinstance(goal_q, (list, tuple)) and len(goal_q) > 0 and isinstance(goal_q[0], (np.ndarray, list, tuple)):
+        raw_goals = [np.asarray(g, dtype=np.float64) for g in goal_q]
+    else:
+        raw_goals = [np.asarray(goal_q, dtype=np.float64)]
+
+    goals = [
+        g
+        for g in raw_goals
+        if g.shape == (dof,)
+        and not in_collision_se3(g, arm, scene_3d, attached_tip_length_m=attached_tip_length_m)
+    ]
+    if not goals:
+        return None
+
+    def _edge_ok(qa: np.ndarray, qb: np.ndarray) -> bool:
+        return edge_free_se3(qa, qb, arm, scene_3d, attached_tip_length_m=attached_tip_length_m)
+
+    goals_sorted = sorted(goals, key=lambda g: float(np.linalg.norm(g - q_s)))
+    for g in goals_sorted:
+        if np.allclose(q_s, g, atol=1e-9):
+            return [q_s.copy()]
+        if _edge_ok(q_s, g):
+            return [q_s.copy(), g.copy()]
+
+    tree_start = _TreeND([q_s], dof=dof, capacity=iters * 2)
+    tree_goal = _TreeND(goals_sorted[:1], dof=dof, capacity=iters * 2)
+    extra_goals = goals_sorted[1:]
+    a_is_start = True
+
+    for it in range(iters):
+        if it == 150 and extra_goals:
+            for eg in extra_goals:
+                tree_goal.append(eg.copy(), -1)
+            extra_goals = []
+
+        # Focused Gaussian-corridor + uniform C-space sampling for fast high-DoF narrow clearance
+        if rng.random() < 0.25:
+            alpha = float(rng.random())
+            mid = (1.0 - alpha) * q_s + alpha * goals_sorted[0]
+            q_rand = arm.clamp_joints(mid + rng.normal(0.0, 0.45, size=dof))  # type: ignore[attr-defined]
+        else:
+            q_rand = arm.sample_configuration(rng)  # type: ignore[attr-defined]
+
+        tree_a = tree_start if a_is_start else tree_goal
+        tree_b = tree_goal if a_is_start else tree_start
+
+        status_a, idx_a = _extend_tree_nd(tree_a, q_rand, step=step, edge_ok_fn=_edge_ok)
+        if status_a != "trapped":
+            q_new = tree_a.nodes[idx_a]
+            status_b, idx_b = _connect_tree_nd(tree_b, q_new, step=step, edge_ok_fn=_edge_ok)
+            if status_b == "reached":
+                path_a = _trace_path(tree_a.nodes, tree_a.parent, idx_a)
+                path_b = _trace_path(tree_b.nodes, tree_b.parent, idx_b)
+                return (path_a + path_b[-2::-1]) if a_is_start else (path_b + path_a[-2::-1])
+        a_is_start = not a_is_start
+    return None
+
+
+def shortcut_se3(
+    path: Sequence[np.ndarray],
+    rng: np.random.Generator,
+    *,
+    arm: object,
+    scene_3d: BenchScene3D = DEFAULT_SCENE_3D,
+    tries: int = 80,
+    attached_tip_length_m: Optional[float] = None,
+) -> List[np.ndarray]:
+    """Smooth an N-DoF SE(3) joint path via non-adjacent shortcutting + deterministic greedy pass."""
+    cleaned: List[Tuple[int, np.ndarray]] = []
+    for uid, pt in enumerate(path):
+        arr = np.asarray(pt, dtype=np.float64).copy()
+        if not cleaned or not np.allclose(arr, cleaned[-1][1], atol=1e-12):
+            cleaned.append((uid, arr))
+    if len(cleaned) < 3:
+        return [arr for _, arr in cleaned]
+
+    def _edge_ok(qa: np.ndarray, qb: np.ndarray) -> bool:
+        return edge_free_se3(qa, qb, arm, scene_3d, attached_tip_length_m=attached_tip_length_m)
+
+    failed: set[Tuple[int, int]] = set()
+    for _ in range(tries):
+        if len(cleaned) < 3:
+            break
+        i = int(rng.integers(0, len(cleaned) - 2))
+        j = int(rng.integers(i + 2, len(cleaned)))
+        key = (cleaned[i][0], cleaned[j][0])
+        if key in failed:
+            continue
+        if _edge_ok(cleaned[i][1], cleaned[j][1]):
+            cleaned = cleaned[: i + 1] + cleaned[j:]
+        else:
+            failed.add(key)
+
+    i = 0
+    while i < len(cleaned) - 2:
+        for j in range(len(cleaned) - 1, i + 1, -1):
+            key = (cleaned[i][0], cleaned[j][0])
+            if key in failed:
+                continue
+            if _edge_ok(cleaned[i][1], cleaned[j][1]):
+                cleaned = cleaned[: i + 1] + cleaned[j:]
+                break
+            failed.add(key)
+        i += 1
+    return [arr for _, arr in cleaned]
+
+
+def _prolate_ellipsoid_rotation(q_start: np.ndarray, q_goal: np.ndarray) -> np.ndarray:
+    """Compute SO(d) rotation aligning e_1 with `(q_goal - q_start) / ||q_goal - q_start||`."""
+    d = q_start.size
+    diff = q_goal - q_start
+    c_min = float(np.linalg.norm(diff))
+    if c_min <= 1e-12:
+        return np.eye(d, dtype=np.float64)
+    a1 = (diff / c_min)[:, None]
+    e1 = np.zeros((1, d), dtype=np.float64)
+    e1[0, 0] = 1.0
+    M = a1 @ e1
+    U, _, Vt = np.linalg.svd(M, full_matrices=True)
+    diag = np.ones(d, dtype=np.float64)
+    diag[-1] = float(np.linalg.det(U) * np.linalg.det(Vt))
+    return U @ np.diag(diag) @ Vt
+
+
+def sample_informed_ellipsoid(
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    c_best: float,
+    q_lower: np.ndarray,
+    q_upper: np.ndarray,
+    rng: np.random.Generator,
+    rot_world_from_ellipsoid: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Direct sampling inside Gammell et al. (2014) admissible prolate hyperellipsoid `X_{f_hat}`."""
+    d = q_start.size
+    c_min = float(np.linalg.norm(q_goal - q_start))
+    if not math.isfinite(c_best) or c_best <= c_min + 1e-12:
+        u = float(rng.random())
+        return np.clip((1.0 - u) * q_start + u * q_goal, q_lower, q_upper)
+
+    C = (
+        _prolate_ellipsoid_rotation(q_start, q_goal)
+        if rot_world_from_ellipsoid is None
+        else rot_world_from_ellipsoid
+    )
+    r1 = 0.5 * c_best
+    r_perp = 0.5 * math.sqrt(max(0.0, c_best * c_best - c_min * c_min))
+    radii = np.full(d, r_perp, dtype=np.float64)
+    radii[0] = r1
+    center = 0.5 * (q_start + q_goal)
+
+    for _ in range(24):
+        z = rng.normal(0.0, 1.0, size=d)
+        nz = float(np.linalg.norm(z))
+        if nz <= 1e-12:
+            continue
+        x_ball = (float(rng.random()) ** (1.0 / float(d))) * (z / nz)
+        cand = center + C @ (radii * x_ball)
+        if bool(np.all(cand >= q_lower) and np.all(cand <= q_upper)):
+            return cand
+
+    z = rng.normal(0.0, 1.0, size=d)
+    nz = max(1e-12, float(np.linalg.norm(z)))
+    x_ball = (float(rng.random()) ** (1.0 / float(d))) * (z / nz)
+    return np.clip(center + C @ (radii * x_ball), q_lower, q_upper)
+
+
+@dataclass(frozen=True)
+class InformedRRTStarResult:
+    """Optimal sampling-based planning result from Informed RRT* (Gammell et al., 2014)."""
+
+    path: List[np.ndarray]
+    best_cost_rad: float
+    initial_cost_rad: float
+    c_min_rad: float
+    cost_history: Tuple[Tuple[int, float], ...]
+    ellipsoid_samples: int
+    total_nodes: int
+
+
+def informed_rrt_star(
+    start_q: Sequence[float] | np.ndarray,
+    goal_q: Sequence[float] | np.ndarray,
+    rng: np.random.Generator,
+    *,
+    arm: object = DEFAULT_ARM,
+    scene: BenchScene = DEFAULT_SCENE,
+    scene_3d: Optional[BenchScene3D] = None,
+    iters: int = 600,
+    step: float = 0.35,
+    goal_bias: float = 0.12,
+    rewire_radius: float = 0.75,
+    attached_tip_length_m: Optional[float] = None,
+    warm_start_connect: bool = True,
+) -> Optional[InformedRRTStarResult]:
+    """Asymptotically optimal Informed RRT* in 2-DoF (`Arm2D`) or 6/7-DoF (`UR5eArm`, `PandaArm`).
+
+    Uses parent cost selection, k-nearest/ball rewiring, and direct prolate hyperellipsoidal
+    sampling `||q - q_start|| + ||q_goal - q|| <= c_best` once an initial feasible path is found.
+    """
+    q_s = np.asarray(start_q, dtype=np.float64)
+    q_g = np.asarray(goal_q, dtype=np.float64)
+    is_2d = isinstance(arm, Arm2D)
+    dof = 2 if is_2d else int(getattr(arm, "dof", q_s.size))
+    if q_s.shape != (dof,) or q_g.shape != (dof,):
+        return None
+
+    eff_scene3d = DEFAULT_SCENE_3D if scene_3d is None else scene_3d
+
+    if is_2d:
+        q_lower = np.array([lo for lo, _ in arm.joint_limits], dtype=np.float64)
+        q_upper = np.array([hi for _, hi in arm.joint_limits], dtype=np.float64)
+
+        def _in_coll(q: np.ndarray) -> bool:
+            return in_collision(q, arm=arm, scene=scene)
+
+        def _edge_ok(qa: np.ndarray, qb: np.ndarray) -> bool:
+            return edge_free(qa, qb, arm=arm, scene=scene)
+
+    else:
+        q_lower = np.asarray(arm.q_lower, dtype=np.float64)  # type: ignore[attr-defined]
+        q_upper = np.asarray(arm.q_upper, dtype=np.float64)  # type: ignore[attr-defined]
+
+        def _in_coll(q: np.ndarray) -> bool:
+            return in_collision_se3(q, arm, eff_scene3d, attached_tip_length_m=attached_tip_length_m)
+
+        def _edge_ok(qa: np.ndarray, qb: np.ndarray) -> bool:
+            return edge_free_se3(qa, qb, arm, eff_scene3d, attached_tip_length_m=attached_tip_length_m)
+
+    if _in_coll(q_s) or _in_coll(q_g):
+        return None
+
+    c_min = float(np.linalg.norm(q_g - q_s))
+    if c_min <= 1e-9:
+        return InformedRRTStarResult(
+            path=[q_s.copy()],
+            best_cost_rad=0.0,
+            initial_cost_rad=0.0,
+            c_min_rad=0.0,
+            cost_history=((0, 0.0),),
+            ellipsoid_samples=0,
+            total_nodes=1,
+        )
+
+    if _edge_ok(q_s, q_g):
+        return InformedRRTStarResult(
+            path=[q_s.copy(), q_g.copy()],
+            best_cost_rad=c_min,
+            initial_cost_rad=c_min,
+            c_min_rad=c_min,
+            cost_history=((0, c_min),),
+            ellipsoid_samples=0,
+            total_nodes=2,
+        )
+
+    nodes: List[np.ndarray] = [q_s.copy()]
+    parent: List[int] = [-1]
+    cost: List[float] = [0.0]
+    children: List[List[int]] = [[]]
+    arr = np.zeros((iters + 64, dof), dtype=np.float64)
+    arr[0] = q_s
+
+    def _add_node(q_pt: np.ndarray, par_idx: int, c_val: float) -> int:
+        nonlocal arr
+        idx = len(nodes)
+        if idx >= len(arr):
+            grown = np.zeros((len(arr) * 2, dof), dtype=np.float64)
+            grown[:idx] = arr[:idx]
+            arr = grown
+        arr[idx] = q_pt
+        nodes.append(q_pt)
+        parent.append(par_idx)
+        cost.append(c_val)
+        children.append([])
+        if par_idx >= 0:
+            children[par_idx].append(idx)
+        return idx
+
+    def _propagate_cost_delta(root_idx: int, delta: float) -> None:
+        stack = list(children[root_idx])
+        while stack:
+            u = stack.pop()
+            cost[u] += delta
+            stack.extend(children[u])
+
+    def _is_descendant(cand_anc: int, node_idx: int) -> bool:
+        cur = node_idx
+        while cur != -1:
+            if cur == cand_anc:
+                return True
+            cur = parent[cur]
+        return False
+
+    goal_parents: List[int] = []
+    c_best = math.inf
+    initial_cost = math.inf
+    cost_history: List[Tuple[int, float]] = []
+    ellipsoid_samples = 0
+    C_rot = _prolate_ellipsoid_rotation(q_s, q_g)
+
+    # Optional fast bidirectional RRT-Connect seed to initialize tree & finite c_best immediately
+    if warm_start_connect:
+        seed_path = (
+            rrt_connect(q_s, q_g, rng, iters=max(200, iters // 2), arm=arm, scene=scene)
+            if is_2d
+            else rrt_connect_se3(
+                q_s,
+                q_g,
+                rng,
+                arm=arm,
+                scene_3d=eff_scene3d,
+                iters=max(200, iters // 2),
+                step=step,
+                attached_tip_length_m=attached_tip_length_m,
+            )
+        )
+        if seed_path is not None and len(seed_path) >= 2:
+            prev_idx = 0
+            for wp in seed_path[1:-1]:
+                d_seg = float(np.linalg.norm(wp - nodes[prev_idx]))
+                if d_seg > 1e-9 and _edge_ok(nodes[prev_idx], wp):
+                    prev_idx = _add_node(wp.copy(), prev_idx, cost[prev_idx] + d_seg)
+            d_last = float(np.linalg.norm(q_g - nodes[prev_idx]))
+            if _edge_ok(nodes[prev_idx], q_g):
+                goal_parents.append(prev_idx)
+                c_best = cost[prev_idx] + d_last
+                initial_cost = c_best
+                cost_history.append((0, c_best))
+
+    gamma_rrt = max(1.5, 2.2 * float(np.linalg.norm(q_upper - q_lower)) / math.sqrt(float(dof)))
+
+    for it in range(1, iters + 1):
+        if math.isfinite(c_best):
+            q_rand = sample_informed_ellipsoid(q_s, q_g, c_best, q_lower, q_upper, rng, C_rot)
+            ellipsoid_samples += 1
+        elif rng.random() < goal_bias:
+            q_rand = q_g
+        else:
+            q_rand = rng.uniform(q_lower, q_upper).astype(np.float64)
+
+        n_cur = len(nodes)
+        diffs = arr[:n_cur] - q_rand[None, :]
+        dists = np.sqrt(np.einsum("ij,ij->i", diffs, diffs))
+        near_idx = int(np.argmin(dists))
+        d_near = float(dists[near_idx])
+        if d_near <= 1e-9:
+            continue
+
+        q_new = q_rand.copy() if d_near <= step else (nodes[near_idx] + (q_rand - nodes[near_idx]) * (step / d_near))
+        # Prune immediately if q_new cannot possibly improve current c_best
+        if math.isfinite(c_best):
+            f_hat = float(np.linalg.norm(q_new - q_s) + np.linalg.norm(q_g - q_new))
+            if f_hat >= c_best - 1e-9:
+                continue
+        if _in_coll(q_new):
+            continue
+
+        # Shrinking RRT* neighborhood ball
+        r_ball = min(
+            rewire_radius,
+            gamma_rrt * ((math.log(float(n_cur + 1)) / float(n_cur + 1)) ** (1.0 / float(dof))),
+        )
+        r_ball = max(r_ball, step * 1.25)
+        diffs_new = arr[:n_cur] - q_new[None, :]
+        dists_new = np.sqrt(np.einsum("ij,ij->i", diffs_new, diffs_new))
+        cand_ids = np.flatnonzero(dists_new <= r_ball)
+        if near_idx not in cand_ids:
+            cand_ids = np.append(cand_ids, near_idx)
+
+        # Keep at most 6 best parent candidates sorted by cost-to-come through candidate
+        cand_Order = sorted(cand_ids.tolist(), key=lambda idx: cost[idx] + float(dists_new[idx]))[:6]
+        best_par = -1
+        best_c = math.inf
+        for cid in cand_Order:
+            c_try = cost[cid] + float(dists_new[cid])
+            if c_try >= best_c - 1e-12:
+                continue
+            if _edge_ok(nodes[cid], q_new):
+                best_par = cid
+                best_c = c_try
+                break
+
+        if best_par == -1:
+            continue
+
+        new_idx = _add_node(q_new, best_par, best_c)
+
+        # Rewire neighborhood through new_idx when strictly cheaper
+        for cid in cand_Order:
+            if cid == best_par or cid == 0:
+                continue
+            d_c = float(dists_new[cid])
+            new_c = best_c + d_c
+            if new_c < cost[cid] - 1e-7 and not _is_descendant(cid, new_idx):
+                if _edge_ok(q_new, nodes[cid]):
+                    old_par = parent[cid]
+                    if old_par >= 0 and cid in children[old_par]:
+                        children[old_par].remove(cid)
+                    parent[cid] = new_idx
+                    children[new_idx].append(cid)
+                    delta = new_c - cost[cid]
+                    cost[cid] = new_c
+                    _propagate_cost_delta(cid, delta)
+
+        # Check direct or step-bounded goal connection
+        d_goal = float(np.linalg.norm(q_g - q_new))
+        if d_goal <= max(step * 1.8, rewire_radius) and (cost[new_idx] + d_goal < c_best - 1e-7):
+            if _edge_ok(q_new, q_g):
+                goal_parents.append(new_idx)
+
+        # Re-evaluate best cost across all goal-connected parents (rewiring can improve earlier goal parents!)
+        if goal_parents:
+            cur_best_par = min(
+                goal_parents,
+                key=lambda pid: cost[pid] + float(np.linalg.norm(q_g - nodes[pid])),
+            )
+            cur_total = cost[cur_best_par] + float(np.linalg.norm(q_g - nodes[cur_best_par]))
+            if cur_total < c_best - 1e-9:
+                c_best = cur_total
+                if not math.isfinite(initial_cost):
+                    initial_cost = c_best
+                cost_history.append((it, c_best))
+
+    if not goal_parents:
+        return None
+
+    best_goal_par = min(
+        goal_parents,
+        key=lambda pid: cost[pid] + float(np.linalg.norm(q_g - nodes[pid])),
+    )
+    opt_path = _trace_path(nodes, parent, best_goal_par)
+    if not np.allclose(opt_path[-1], q_g, atol=1e-9):
+        opt_path.append(q_g.copy())
+    final_cost = path_length(opt_path)
+    return InformedRRTStarResult(
+        path=opt_path,
+        best_cost_rad=final_cost,
+        initial_cost_rad=(initial_cost if math.isfinite(initial_cost) else final_cost),
+        c_min_rad=c_min,
+        cost_history=tuple(cost_history),
+        ellipsoid_samples=ellipsoid_samples,
+        total_nodes=len(nodes),
+    )
+
