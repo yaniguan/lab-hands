@@ -1,0 +1,411 @@
+{
+  "kinematics_planning_toppra": {
+    "opentrons_flex": {
+      "deck_bounds_mm": [
+        [
+          0.0,
+          418.0
+        ],
+        [
+          0.0,
+          353.0
+        ],
+        [
+          0.0,
+          218.0
+        ]
+      ],
+      "dof": 4,
+      "fk_ik_exact_roundtrip": true
+    },
+    "panda": {
+      "dof": 7,
+      "informed_rrt_star_best_mean_rad": 1.708,
+      "informed_rrt_star_initial_mean_rad": 2.235,
+      "mean_ik_pos_error_um": 2.168,
+      "mean_manipulability": 0.0329,
+      "min_3d_capsule_clearance_mm": 5.03,
+      "rrt_connect_mean_ms": 173.25,
+      "rrt_connect_shortcut_mean_rad": 1.754,
+      "success_rate_pct": 100.0,
+      "toppra_mean_duration_s": 0.8725,
+      "wells_tested": 6
+    },
+    "ur5e": {
+      "dof": 6,
+      "informed_rrt_star_best_mean_rad": 3.065,
+      "informed_rrt_star_initial_mean_rad": 3.282,
+      "mean_ik_pos_error_um": 0.922,
+      "mean_manipulability": 0.0198,
+      "min_3d_capsule_clearance_mm": 4.74,
+      "rrt_connect_mean_ms": 329.39,
+      "rrt_connect_shortcut_mean_rad": 3.06,
+      "success_rate_pct": 100.0,
+      "toppra_mean_duration_s": 2.934,
+      "wells_tested": 6
+    }
+  },
+  "real_dataset_and_opentrons_interfaces": {
+    "autobio_pipette_mujoco": {
+      "dtypes": {
+        "action": "float32",
+        "episode_index": "int64",
+        "frame_index": "int64",
+        "next.done": "bool",
+        "observation.state": "float32",
+        "timestamp": "float32"
+      },
+      "episode_index": 0,
+      "fps": 50.0,
+      "n_frames": 100,
+      "raw_observation_state_shape": [
+        100,
+        14
+      ],
+      "single_arm_action_shape": [
+        100,
+        7
+      ],
+      "single_arm_observation_state_shape": [
+        100,
+        7
+      ]
+    },
+    "finebio_P01_01_01": {
+      "compiled_ur5e_steps": 4,
+      "deck_mm_bounds_verified": true,
+      "total_opentrons_gantry_frames": 144,
+      "total_protocol_steps": 9
+    },
+    "lerobot": {
+      "dtypes": {
+        "action": "float32",
+        "episode_index": "int64",
+        "frame_index": "int64",
+        "next.done": "bool",
+        "observation.state": "float32",
+        "timestamp": "float32"
+      },
+      "episode_index": 0,
+      "fps": 50.0,
+      "n_frames": 100,
+      "raw_observation_state_shape": [
+        100,
+        14
+      ],
+      "single_arm_action_shape": [
+        100,
+        7
+      ],
+      "single_arm_observation_state_shape": [
+        100,
+        7
+      ]
+    }
+  },
+  "schema": "lab-hands/frontier-benchmarks/v1",
+  "slosh_factorial_6dof": {
+    "base_toppra_duration_s": 0.4112,
+    "benchmark": "6dof_ur5e_nonlinear_bessel_input_shaping_factorial",
+    "fill_fractions": [
+      0.25,
+      0.5,
+      0.75,
+      0.85
+    ],
+    "labware": [
+      "96_well",
+      "384_well"
+    ],
+    "liquids": [
+      "water",
+      "pbs_surfactant",
+      "glycerol_50pct"
+    ],
+    "summary_by_regime": {
+      "mismatch_minus25pct": {
+        "min_jerk_unshaped": {
+          "max_eta_over_h_free": 1.1734,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.4138,
+          "mean_residual_ringdown_mm": 0.2642,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_EI": {
+          "max_eta_over_h_free": 1.014,
+          "mean_cycle_overhead_pct": 23.76,
+          "mean_duration_s": 0.5089,
+          "mean_eta_over_h_free": 0.3885,
+          "mean_residual_ringdown_mm": 0.0342,
+          "n_conditions": 24,
+          "spill_rate_pct": 4.17,
+          "spills": 1
+        },
+        "toppra_ZV": {
+          "max_eta_over_h_free": 1.2167,
+          "mean_cycle_overhead_pct": 12.41,
+          "mean_duration_s": 0.4623,
+          "mean_eta_over_h_free": 0.4439,
+          "mean_residual_ringdown_mm": 0.0667,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_ZVD": {
+          "max_eta_over_h_free": 1.0182,
+          "mean_cycle_overhead_pct": 23.82,
+          "mean_duration_s": 0.5092,
+          "mean_eta_over_h_free": 0.3912,
+          "mean_residual_ringdown_mm": 0.0402,
+          "n_conditions": 24,
+          "spill_rate_pct": 4.17,
+          "spills": 1
+        },
+        "toppra_unshaped": {
+          "max_eta_over_h_free": 1.7615,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.6236,
+          "mean_residual_ringdown_mm": 0.1615,
+          "n_conditions": 24,
+          "spill_rate_pct": 16.67,
+          "spills": 4
+        }
+      },
+      "mismatch_plus25pct": {
+        "min_jerk_unshaped": {
+          "max_eta_over_h_free": 1.1734,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.4138,
+          "mean_residual_ringdown_mm": 0.2642,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_EI": {
+          "max_eta_over_h_free": 1.1008,
+          "mean_cycle_overhead_pct": 16.39,
+          "mean_duration_s": 0.4786,
+          "mean_eta_over_h_free": 0.4107,
+          "mean_residual_ringdown_mm": 0.0177,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_ZV": {
+          "max_eta_over_h_free": 1.2586,
+          "mean_cycle_overhead_pct": 8.82,
+          "mean_duration_s": 0.4475,
+          "mean_eta_over_h_free": 0.4591,
+          "mean_residual_ringdown_mm": 0.0419,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_ZVD": {
+          "max_eta_over_h_free": 1.121,
+          "mean_cycle_overhead_pct": 16.52,
+          "mean_duration_s": 0.4791,
+          "mean_eta_over_h_free": 0.4175,
+          "mean_residual_ringdown_mm": 0.0206,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_unshaped": {
+          "max_eta_over_h_free": 1.7615,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.6236,
+          "mean_residual_ringdown_mm": 0.1615,
+          "n_conditions": 24,
+          "spill_rate_pct": 16.67,
+          "spills": 4
+        }
+      },
+      "mismatch_pooled_pm25pct": {
+        "min_jerk_unshaped": {
+          "max_eta_over_h_free": 1.1734,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.4138,
+          "mean_residual_ringdown_mm": 0.2642,
+          "n_conditions": 48,
+          "spill_rate_pct": 12.5,
+          "spills": 6
+        },
+        "toppra_EI": {
+          "max_eta_over_h_free": 1.1008,
+          "mean_cycle_overhead_pct": 20.08,
+          "mean_duration_s": 0.4938,
+          "mean_eta_over_h_free": 0.3996,
+          "mean_residual_ringdown_mm": 0.026,
+          "n_conditions": 48,
+          "spill_rate_pct": 8.33,
+          "spills": 4
+        },
+        "toppra_ZV": {
+          "max_eta_over_h_free": 1.2586,
+          "mean_cycle_overhead_pct": 10.61,
+          "mean_duration_s": 0.4549,
+          "mean_eta_over_h_free": 0.4515,
+          "mean_residual_ringdown_mm": 0.0543,
+          "n_conditions": 48,
+          "spill_rate_pct": 12.5,
+          "spills": 6
+        },
+        "toppra_ZVD": {
+          "max_eta_over_h_free": 1.121,
+          "mean_cycle_overhead_pct": 20.17,
+          "mean_duration_s": 0.4942,
+          "mean_eta_over_h_free": 0.4043,
+          "mean_residual_ringdown_mm": 0.0304,
+          "n_conditions": 48,
+          "spill_rate_pct": 8.33,
+          "spills": 4
+        },
+        "toppra_unshaped": {
+          "max_eta_over_h_free": 1.7615,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.6236,
+          "mean_residual_ringdown_mm": 0.1615,
+          "n_conditions": 48,
+          "spill_rate_pct": 16.67,
+          "spills": 8
+        }
+      },
+      "nominal": {
+        "min_jerk_unshaped": {
+          "max_eta_over_h_free": 1.1734,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.4138,
+          "mean_residual_ringdown_mm": 0.2642,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_EI": {
+          "max_eta_over_h_free": 1.0763,
+          "mean_cycle_overhead_pct": 19.66,
+          "mean_duration_s": 0.4921,
+          "mean_eta_over_h_free": 0.4028,
+          "mean_residual_ringdown_mm": 0.0158,
+          "n_conditions": 24,
+          "spill_rate_pct": 4.17,
+          "spills": 1
+        },
+        "toppra_ZV": {
+          "max_eta_over_h_free": 1.1207,
+          "mean_cycle_overhead_pct": 10.24,
+          "mean_duration_s": 0.4533,
+          "mean_eta_over_h_free": 0.4154,
+          "mean_residual_ringdown_mm": 0.0228,
+          "n_conditions": 24,
+          "spill_rate_pct": 12.5,
+          "spills": 3
+        },
+        "toppra_ZVD": {
+          "max_eta_over_h_free": 1.0633,
+          "mean_cycle_overhead_pct": 19.69,
+          "mean_duration_s": 0.4922,
+          "mean_eta_over_h_free": 0.4009,
+          "mean_residual_ringdown_mm": 0.0166,
+          "n_conditions": 24,
+          "spill_rate_pct": 4.17,
+          "spills": 1
+        },
+        "toppra_unshaped": {
+          "max_eta_over_h_free": 1.7615,
+          "mean_cycle_overhead_pct": 0.0,
+          "mean_duration_s": 0.4112,
+          "mean_eta_over_h_free": 0.6236,
+          "mean_residual_ringdown_mm": 0.1615,
+          "n_conditions": 24,
+          "spill_rate_pct": 16.67,
+          "spills": 4
+        }
+      }
+    }
+  },
+  "tactile_coulomb_whitney_500": {
+    "benchmark": "3d_coulomb_whitney_tactile_insertion_500_trials",
+    "geometry": {
+      "bore_clearance_mm": 0.1,
+      "capture_radius_mm": 0.8,
+      "chamfer_width_mm": 0.7,
+      "hole_radius_mm": 3.4,
+      "max_voronoi_search_radius_mm": 4.5
+    },
+    "n_trials": 500,
+    "ranges": {
+      "friction_coeff": [
+        0.15,
+        0.45
+      ],
+      "offset_mm": [
+        0.0,
+        4.0
+      ],
+      "tilt_deg": [
+        0.0,
+        2.5
+      ]
+    },
+    "regimes": {
+      "active_spiral_bayesian_tactile": {
+        "jam_or_wedge_rate_pct": 0.0,
+        "max_final_error_mm_given_success": 0.1003,
+        "mean_final_error_mm_given_success": 0.045,
+        "mean_peak_force_n": 0.602,
+        "mean_spiral_probes": 41.6,
+        "mean_steps": 58.4,
+        "rim_hangup_rate_pct": 0.0,
+        "success_count": 495,
+        "success_rate_pct": 99.0,
+        "trials": 500
+      },
+      "local_shear_admittance": {
+        "jam_or_wedge_rate_pct": 0.0,
+        "max_final_error_mm_given_success": 0.1009,
+        "mean_final_error_mm_given_success": 0.0588,
+        "mean_peak_force_n": 1.273,
+        "mean_spiral_probes": 0.0,
+        "mean_steps": 7.0,
+        "rim_hangup_rate_pct": 80.0,
+        "success_count": 95,
+        "success_rate_pct": 19.0,
+        "trials": 500
+      },
+      "open_loop": {
+        "jam_or_wedge_rate_pct": 3.4,
+        "max_final_error_mm_given_success": 0.0812,
+        "mean_final_error_mm_given_success": 0.0428,
+        "mean_peak_force_n": 1.325,
+        "mean_spiral_probes": 0.0,
+        "mean_steps": 4.4,
+        "rim_hangup_rate_pct": 80.0,
+        "success_count": 6,
+        "success_rate_pct": 1.2,
+        "trials": 500
+      },
+      "passive_rcc_compliance": {
+        "jam_or_wedge_rate_pct": 4.0,
+        "max_final_error_mm_given_success": 0.0972,
+        "mean_final_error_mm_given_success": 0.0426,
+        "mean_peak_force_n": 1.364,
+        "mean_spiral_probes": 0.0,
+        "mean_steps": 5.4,
+        "rim_hangup_rate_pct": 83.8,
+        "success_count": 20,
+        "success_rate_pct": 4.0,
+        "trials": 500
+      }
+    }
+  }
+}

@@ -107,6 +107,7 @@ def _build_safe_se3_episode_rows(
                 "observation.state": state7,
                 "action": state7,
                 "task_index": 0,
+                "robot_type": "arm_se3",
             }
         )
     return rows
@@ -206,7 +207,7 @@ def test_lerobot_jsonl_hf_rows_and_parquet_loaders_and_safe_audit(
     jsonl_path = tmp_path / "episode_000000.jsonl"
     jsonl_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
-    ep_jsonl = load_lerobot_episode(jsonl_path, dataset_id="lerobot")
+    ep_jsonl = load_lerobot_episode(jsonl_path, dataset_id="lerobot", robot_type="arm_se3")
     assert ep_jsonl.n_frames == len(rows)
     assert ep_jsonl.fps == pytest.approx(50.0, abs=0.2)
     assert ep_jsonl.q6_se3.shape == (len(rows), 6)
@@ -214,6 +215,7 @@ def test_lerobot_jsonl_hf_rows_and_parquet_loaders_and_safe_audit(
 
     audit_ok = audit_lerobot_episode(
         ep_jsonl,
+        base_pose_in_deck=PoseSE3(xyz=(0.0, 0.0, 0.0), rpy=(0.0, 0.0, 0.0)),
         allowed_wells_xy=[DEFAULT_SCENE.tube_xy, DEFAULT_SCENE.plate.well_xy("A1")],
     )
     assert audit_ok.safe is True
@@ -404,19 +406,19 @@ def test_finebio_action_annotations_loader_se3_plans_and_slosh_audit(tmp_path: P
     anns = load_finebio_annotations(db_path, take_id="P01_01_01", deck=deck)
     assert len(anns) == 4
     assert anns[0].target_ref == "tips:A1"
-    assert anns[0].attached_tip_length_m == pytest.approx(0.058)
+    assert anns[0].attached_tip_length_m == pytest.approx(0.05183, abs=1e-5)
     assert anns[1].target_ref == "eppendorf:A1"
-    assert anns[1].attached_tip_length_m == pytest.approx(0.058)
+    assert anns[1].attached_tip_length_m == pytest.approx(0.05183, abs=1e-5)
     # 3D coordinate snapping resolves B2 on slot-5 96-well plate
     assert anns[2].target_ref == "plate96:B2"
-    assert anns[2].attached_tip_length_m == pytest.approx(0.058)
+    assert anns[2].attached_tip_length_m == pytest.approx(0.05183, abs=1e-5)
 
     plans = convert_finebio_to_se3_plans(anns, seed=0, deck=deck)
     assert all(plan is not None for _, plan in plans)
-    # With 120 mm Falcon rack on slot 1 + 58 mm mounted 200 uL filter tip, safe transit > 183 mm
+    # With 124.35 mm Falcon rack on slot 1 + 51.83 mm mounted 200 uL filter tip, safe transit > 181 mm
     for _, plan in plans[:3]:
         assert plan is not None
-        assert plan.z_safe_transit_m >= 0.120 + 0.058 + 0.005
+        assert plan.z_safe_transit_m >= 0.12435 + 0.05183 + 0.005
 
     audits = audit_finebio_annotations(anns, seed=0, deck=deck)
     assert len(audits) == 4

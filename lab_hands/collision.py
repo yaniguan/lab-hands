@@ -27,7 +27,7 @@ class BenchScene:
     tube_radius_m: float = 0.0055
     z_tube_bottom: float = 0.010
     z_tube_rim: float = 0.075
-    z_plate_rim: float = 0.015
+    z_plate_rim: Optional[float] = None
     z_safe_travel: Optional[float] = None
     z_max: float = 0.300
     z_margin_m: float = 0.005
@@ -46,7 +46,11 @@ class BenchScene:
         if self.z_margin_m < 0.0:
             raise ValueError(f"z_margin_m must be >= 0, got {self.z_margin_m}")
 
-        eff_plate_rim = max(float(self.z_plate_rim), float(self.plate.z_rim_m))
+        eff_plate_rim = (
+            float(self.plate.z_rim_m)
+            if self.z_plate_rim is None
+            else max(float(self.z_plate_rim), float(self.plate.z_rim_m))
+        )
         object.__setattr__(self, "z_plate_rim", eff_plate_rim)
 
         deck_rim = self.deck.max_rim_m if self.deck is not None else 0.0
@@ -658,3 +662,403 @@ def edge_free_3d(
         ):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# 3D Multi-Link Capsule-vs-AABB & Self-Collision Continuous Swept Checks (SE3)
+# ---------------------------------------------------------------------------
+
+DEFAULT_OBSTACLES_3D: Tuple[Tuple[float, float, float, float, float, float], ...] = (
+    (0.33, -0.08, 0.00, 0.36, 0.12, 0.24),  # tall rack partition (240 mm)
+    (0.15, 0.27, 0.00, 0.24, 0.34, 0.23),  # 1 L reagent media bottle (230 mm)
+)
+
+
+@dataclass(frozen=True)
+class BenchScene3D:
+    """3D benchtop collision scene with 3D AABBs, table plane, labware rims, and mounted tip."""
+
+    obstacles_3d: Tuple[Tuple[float, float, float, float, float, float], ...] = DEFAULT_OBSTACLES_3D
+    include_table_slab: bool = True
+    table_z_m: float = 0.0
+    attached_tip_length_m: float = 0.0
+    margin_m: float = 0.005
+    _boxes3d: np.ndarray = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        raw_list: List[Tuple[float, float, float, float, float, float]] = []
+        for idx, b in enumerate(self.obstacles_3d):
+            if len(b) != 6 or b[0] > b[3] or b[1] > b[4] or b[2] > b[5]:
+                raise ValueError(f"Invalid 3D AABB[{idx}]={b!r}")
+            raw_list.append(tuple(float(v) for v in b))  # type: ignore[arg-type]
+        if self.include_table_slab:
+            # Benchtop table surface excluding central cobot mounting pedestal around (0, 0)
+            tz = float(self.table_z_m)
+            raw_list.append((-1.20, -1.20, tz - 0.12, 1.20, 1.20, tz))
+        arr = np.asarray(raw_list, dtype=np.float64) if raw_list else np.zeros((0, 6), dtype=np.float64)
+        object.__setattr__(self, "_boxes3d", arr)
+
+    @property
+    def obstacle_array_3d(self) -> np.ndarray:
+        return self._boxes3d
+
+    @classmethod
+    def from_bench_scene(
+        cls,
+        scene: BenchScene = DEFAULT_SCENE,
+        *,
+        obstacle_height_m: float = 0.24,
+        include_table_slab: bool = True,
+    ) -> "BenchScene3D":
+        boxes_3d = tuple(
+            (float(x0), float(y0), 0.0, float(x1), float(y1), float(obstacle_height_m))
+            for (x0, y0, x1, y1) in scene.obstacles
+        )
+        return cls(
+            obstacles_3d=boxes_3d,
+            include_table_slab=include_table_slab,
+            attached_tip_length_m=float(scene.attached_tip_length_m),
+            margin_m=float(scene.z_margin_m),
+        )
+
+
+DEFAULT_SCENE_3D = BenchScene3D()
+
+
+def segment_aabb_distance_3d(
+    p0: np.ndarray | Sequence[float],
+    p1: np.ndarray | Sequence[float],
+    boxes_3d: np.ndarray,
+) -> np.ndarray:
+    """Exact 3D Euclidean distance from line segment(s) `p0->p1` `(..., 3)` to closed 3D AABB(s) `(M, 6)`.
+
+    Exploits exact convexity and piecewise-quadratic structure of `sum_c max(0, bmin_c - p_c(u), p_c(u) - bmax_c)^2`
+    across the `<= 6` slab-crossing breakpoints in `[0, 1]`, evaluating both exact interval vertices
+    `-B / A` and slab breakpoints with zero discretization error!
+    """
+    a = np.asarray(p0, dtype=np.float64)
+    b = np.asarray(p1, dtype=np.float64)
+    boxes = np.asarray(boxes_3d, dtype=np.float64)
+    if boxes.shape[0] == 0:
+        return np.full(a.shape[:-1] + (0,), np.inf, dtype=np.float64)
+
+    d = b - a  # (..., 3)
+    bmin = boxes[:, :3]  # (M, 3)
+    bmax = boxes[:, 3:]  # (M, 3)
+
+    a_e = a[..., None, :]  # (..., 1, 3)
+    d_e = d[..., None, :]  # (..., 1, 3)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        valid_d = np.abs(d_e) > 1e-15
+        safe_d = np.where(valid_d, d_e, 1.0)
+        u_lo = np.where(valid_d, (bmin - a_e) / safe_d, 0.0)
+        u_hi = np.where(valid_d, (bmax - a_e) / safe_d, 0.0)
+
+    u_lo = np.clip(u_lo, 0.0, 1.0)
+    u_hi = np.clip(u_hi, 0.0, 1.0)
+    zeros = np.zeros(u_lo.shape[:-1] + (1,), dtype=np.float64)
+    ones = np.ones(u_lo.shape[:-1] + (1,), dtype=np.float64)
+
+    # 8 sorted breakpoints in [0, 1] -> 7 intervals on which active AABB faces are constant
+    u_breaks = np.sort(np.concatenate([zeros, ones, u_lo, u_hi], axis=-1), axis=-1)  # (..., M, 8)
+    ua = u_breaks[..., :-1]  # (..., M, 7)
+    ub = u_breaks[..., 1:]  # (..., M, 7)
+    um = 0.5 * (ua + ub)  # (..., M, 7)
+
+    pm = a_e[..., None, :] + um[..., None] * d_e[..., None, :]  # (..., M, 7, 3)
+    bmin_i = bmin[..., None, :]  # (M, 1, 3)
+    bmax_i = bmax[..., None, :]  # (M, 1, 3)
+
+    below = pm < bmin_i
+    above = pm > bmax_i
+    active = below | above
+
+    r0 = np.where(
+        below,
+        a_e[..., None, :] - bmin_i,
+        np.where(above, a_e[..., None, :] - bmax_i, 0.0),
+    )
+    dc = np.where(active, d_e[..., None, :], 0.0)
+
+    A = np.sum(dc * dc, axis=-1)  # (..., M, 7)
+    B = np.sum(dc * r0, axis=-1)  # (..., M, 7)
+    u_vert = np.where(A > 1e-28, -B / np.maximum(A, 1e-28), um)
+    u_vert = np.clip(u_vert, ua, ub)
+
+    # Candidate minimizers in [0, 1]: all 8 breakpoints + all 7 exact quadratic vertices (15 points)
+    u_cands = np.concatenate([u_breaks, u_vert], axis=-1)  # (..., M, 15)
+    pts = a_e[..., None, :] + u_cands[..., None] * d_e[..., None, :]  # (..., M, 15, 3)
+    diff_lo = bmin_i - pts
+    diff_hi = pts - bmax_i
+    delta = np.maximum(0.0, np.maximum(diff_lo, diff_hi))
+    d2 = np.sum(delta * delta, axis=-1)  # (..., M, 15)
+    return np.sqrt(np.min(d2, axis=-1))
+
+
+def capsule_aabb_clearance_3d(
+    p0: np.ndarray | Sequence[float],
+    p1: np.ndarray | Sequence[float],
+    capsule_radii: np.ndarray | float,
+    boxes_3d: np.ndarray,
+) -> np.ndarray:
+    """Exact 3D capsule-surface-to-AABB Euclidean clearance `(..., M)`."""
+    radii = np.asarray(capsule_radii, dtype=np.float64)
+    if bool(np.any(radii < 0.0)):
+        raise ValueError("capsule_radii must be >= 0")
+    dist = segment_aabb_distance_3d(p0, p1, boxes_3d)
+    return np.maximum(0.0, dist - radii[..., None])
+
+
+def segment_segment_distance_3d(
+    a0: np.ndarray | Sequence[float],
+    a1: np.ndarray | Sequence[float],
+    b0: np.ndarray | Sequence[float],
+    b1: np.ndarray | Sequence[float],
+) -> float:
+    """Exact 3D Euclidean distance between two closed line segments `a0->a1` and `b0->b1`."""
+    p1 = np.asarray(a0, dtype=np.float64)
+    q1 = np.asarray(a1, dtype=np.float64)
+    p2 = np.asarray(b0, dtype=np.float64)
+    q2 = np.asarray(b1, dtype=np.float64)
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = float(np.dot(d1, d1))
+    e = float(np.dot(d2, d2))
+    f = float(np.dot(d2, r))
+
+    if a <= 1e-18 and e <= 1e-18:
+        return float(np.linalg.norm(r))
+    if a <= 1e-18:
+        s = 0.0
+        t = float(np.clip(f / e, 0.0, 1.0))
+    else:
+        c = float(np.dot(d1, r))
+        if e <= 1e-18:
+            t = 0.0
+            s = float(np.clip(-c / a, 0.0, 1.0))
+        else:
+            b = float(np.dot(d1, d2))
+            denom = a * e - b * b
+            s = float(np.clip((b * f - c * e) / denom, 0.0, 1.0)) if denom > 1e-18 else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = float(np.clip(-c / a, 0.0, 1.0))
+            elif t > 1.0:
+                t = 1.0
+                s = float(np.clip((b - c) / a, 0.0, 1.0))
+    closest = (p1 + s * d1) - (p2 + t * d2)
+    return float(np.linalg.norm(closest))
+
+
+def min_clearance_se3(
+    q: Sequence[float] | np.ndarray,
+    arm: object,
+    scene_3d: BenchScene3D = DEFAULT_SCENE_3D,
+    *,
+    attached_tip_length_m: Optional[float] = None,
+    check_self_collision: bool = True,
+) -> float:
+    """Exact minimum 3D capsule-to-AABB (and non-adjacent self-link) surface clearance (m)."""
+    eff_tip = (
+        float(scene_3d.attached_tip_length_m)
+        if attached_tip_length_m is None
+        else float(attached_tip_length_m)
+    )
+    p0s, p1s, radii = arm.link_capsules(q, attached_tip_length_m=eff_tip)  # type: ignore[attr-defined]
+    boxes = scene_3d.obstacle_array_3d
+    best = math.inf
+
+    if boxes.shape[0] > 0:
+        # Exclude shoulder column (index 0) from floor-slab check since base bolts to table z=0
+        if scene_3d.include_table_slab and boxes.shape[0] >= 1:
+            obs_boxes = boxes[:-1]
+            slab_box = boxes[-1:]
+            if obs_boxes.shape[0] > 0:
+                cl_obs = capsule_aabb_clearance_3d(p0s, p1s, radii, obs_boxes)
+                best = min(best, float(np.min(cl_obs)))
+            if p0s.shape[0] > 1:
+                cl_slab = capsule_aabb_clearance_3d(p0s[1:], p1s[1:], radii[1:], slab_box)
+                best = min(best, float(np.min(cl_slab)))
+        else:
+            cl_all = capsule_aabb_clearance_3d(p0s, p1s, radii, boxes)
+            best = min(best, float(np.min(cl_all)))
+
+    if check_self_collision and p0s.shape[0] >= 3:
+        n_caps = int(p0s.shape[0])
+        for i in range(n_caps):
+            for j in range(i + 2, n_caps):
+                d_seg = segment_segment_distance_3d(p0s[i], p1s[i], p0s[j], p1s[j])
+                cl_self = max(0.0, d_seg - float(radii[i] + radii[j]))
+                if cl_self < best:
+                    best = cl_self
+    return best
+
+
+def in_collision_se3(
+    q: Sequence[float] | np.ndarray,
+    arm: object,
+    scene_3d: BenchScene3D = DEFAULT_SCENE_3D,
+    *,
+    margin_m: Optional[float] = None,
+    attached_tip_length_m: Optional[float] = None,
+) -> bool:
+    """Return True if `q` violates joint limits, self-collides, or breaches 3D AABB `margin_m`."""
+    if not arm.within_joint_limits(q):  # type: ignore[attr-defined]
+        return True
+    eff_margin = float(scene_3d.margin_m if margin_m is None else margin_m)
+    cl = min_clearance_se3(
+        q,
+        arm,
+        scene_3d=scene_3d,
+        attached_tip_length_m=attached_tip_length_m,
+    )
+    return bool(cl <= eff_margin)
+
+
+def kinematic_sweep_bound_se3(
+    qa: Sequence[float] | np.ndarray,
+    qb: Sequence[float] | np.ndarray,
+    arm: object,
+    *,
+    attached_tip_length_m: float = 0.0,
+) -> float:
+    """Tight physical multi-joint Jacobian Lipschitz upper bound (m) on any link/tip displacement."""
+    a = np.asarray(qa, dtype=np.float64)
+    b = np.asarray(qb, dtype=np.float64)
+    dq = np.abs(b - a)
+    kinds = getattr(arm, "joint_kinds", ("revolute",) * dq.size)
+    # Physical distal lever-arm ceilings (shoulder -> forearm -> wrist) for UR5e / Panda class cobots
+    base_levers = (0.86, 0.86, 0.46, 0.16, 0.12, 0.04, 0.03)
+    total = 0.0
+    n = dq.size
+    for i in range(n):
+        if kinds[i] == "prismatic":
+            total += float(dq[i])
+        else:
+            lev = base_levers[i] if i < len(base_levers) else 0.10
+            total += (lev + float(attached_tip_length_m)) * float(dq[i])
+    return float(total)
+
+
+def edge_free_se3(
+    qa: Sequence[float] | np.ndarray,
+    qb: Sequence[float] | np.ndarray,
+    arm: object,
+    scene_3d: BenchScene3D = DEFAULT_SCENE_3D,
+    *,
+    max_sweep_step_m: float = 0.040,
+    margin_m: Optional[float] = None,
+    attached_tip_length_m: Optional[float] = None,
+) -> bool:
+    """Continuous Lipschitz-certified 3D multi-link capsule-vs-AABB swept collision check."""
+    a = np.asarray(qa, dtype=np.float64)
+    b = np.asarray(qb, dtype=np.float64)
+    if not (arm.within_joint_limits(a) and arm.within_joint_limits(b)):  # type: ignore[attr-defined]
+        return False
+
+    eff_tip = (
+        float(scene_3d.attached_tip_length_m)
+        if attached_tip_length_m is None
+        else float(attached_tip_length_m)
+    )
+    base_margin = float(scene_3d.margin_m if margin_m is None else margin_m)
+
+    if in_collision_se3(a, arm, scene_3d, margin_m=base_margin, attached_tip_length_m=eff_tip):
+        return False
+    if in_collision_se3(b, arm, scene_3d, margin_m=base_margin, attached_tip_length_m=eff_tip):
+        return False
+
+    sweep = kinematic_sweep_bound_se3(a, b, arm, attached_tip_length_m=eff_tip)
+    if sweep <= 1e-12:
+        return True
+
+    n = max(2, int(math.ceil(sweep / max_sweep_step_m)) + 1)
+    s_grid = np.linspace(0.0, 1.0, n, dtype=np.float64)
+    half_step_m = 0.5 * sweep / float(n - 1)
+    diff = b - a
+
+    # Coarse midpoint early-reject for long chords
+    if n > 8:
+        for sc in (0.5, 0.25, 0.75):
+            if in_collision_se3(a + sc * diff, arm, scene_3d, margin_m=base_margin, attached_tip_length_m=eff_tip):
+                return False
+
+    cl_samples = np.array(
+        [
+            min_clearance_se3(a + float(s) * diff, arm, scene_3d, attached_tip_length_m=eff_tip)
+            for s in s_grid
+        ],
+        dtype=np.float64,
+    )
+    if bool(np.any(cl_samples <= base_margin)):
+        return False
+    if bool(np.all(cl_samples > base_margin + half_step_m)):
+        return True
+
+    # Adaptive Lipschitz midpoint refinement on narrow-band intervals
+    uncertain_intervals = (cl_samples[:-1] <= base_margin + half_step_m) | (
+        cl_samples[1:] <= base_margin + half_step_m
+    )
+    s_lo = s_grid[:-1][uncertain_intervals]
+    s_hi = s_grid[1:][uncertain_intervals]
+
+    for _ in range(10):
+        if s_lo.size == 0:
+            return True
+        s_mid = 0.5 * (s_lo + s_hi)
+        rad = 0.5 * (s_hi - s_lo) * sweep
+        cl_mid = np.array(
+            [
+                min_clearance_se3(a + float(sm) * diff, arm, scene_3d, attached_tip_length_m=eff_tip)
+                for sm in s_mid
+            ],
+            dtype=np.float64,
+        )
+        if bool(np.any(cl_mid <= base_margin)):
+            return False
+        still = cl_mid <= (base_margin + rad)
+        if not bool(np.any(still)):
+            return True
+        lo_u = s_lo[still]
+        mid_u = s_mid[still]
+        hi_u = s_hi[still]
+        s_lo = np.concatenate([lo_u, mid_u])
+        s_hi = np.concatenate([mid_u, hi_u])
+    return False
+
+
+def path_min_clearance_se3(
+    path: Sequence[Sequence[float] | np.ndarray],
+    arm: object,
+    scene_3d: BenchScene3D = DEFAULT_SCENE_3D,
+    *,
+    max_sweep_step_m: float = 0.008,
+    attached_tip_length_m: Optional[float] = None,
+) -> float:
+    """Certified minimum 3D capsule-to-AABB surface clearance (m) along a multi-DoF joint path."""
+    if not path:
+        raise ValueError("path must be non-empty")
+    eff_tip = (
+        float(scene_3d.attached_tip_length_m)
+        if attached_tip_length_m is None
+        else float(attached_tip_length_m)
+    )
+    pts = [np.asarray(p, dtype=np.float64) for p in path]
+    best = min(min_clearance_se3(p, arm, scene_3d, attached_tip_length_m=eff_tip) for p in pts)
+    if len(pts) == 1 or best <= 0.0:
+        return max(0.0, best)
+
+    for qa, qb in zip(pts, pts[1:]):
+        sweep = kinematic_sweep_bound_se3(qa, qb, arm, attached_tip_length_m=eff_tip)
+        if sweep <= 1e-12:
+            continue
+        n = max(3, int(math.ceil(sweep / max_sweep_step_m)) + 1)
+        half_step = 0.5 * sweep / float(n - 1)
+        for s in np.linspace(0.0, 1.0, n)[1:-1]:
+            cl = min_clearance_se3(qa + float(s) * (qb - qa), arm, scene_3d, attached_tip_length_m=eff_tip)
+            best = min(best, max(0.0, cl - 0.25 * half_step))
+    return max(0.0, best)
+

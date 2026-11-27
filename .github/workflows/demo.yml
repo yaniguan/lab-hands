@@ -15,8 +15,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt
+      - name: Enable Windows long paths for opentrons-shared-data definitions
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+      - run: pip install -r requirements.txt opentrons-shared-data
       - run: python -m pytest -q
       - run: python demo/plan_to_well.py
       - run: python demo/plan_to_well.py --planner rrt_connect
+      - run: python demo/plan_to_well.py --arm ur5e --seeds 2
+      - run: python demo/plan_to_well.py --arm panda --seeds 2
       - run: python demo/tactile_insert.py

@@ -1,4 +1,8 @@
 data/
+!lab_hands/data/
+!lab_hands/data/**
+runs/
+lean/.lake/
 __pycache__/
 *.pyc
 .pytest_cache/

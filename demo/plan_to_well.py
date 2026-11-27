@@ -1,7 +1,12 @@
-"""Benchtop motion-planning benchmark: move a pipette tip held by a planar 2-link arm
-from a tube rack to named wells of an SBS 96-well plate, avoiding a rack wall and a
-reagent bottle. Supports forward RRT and bidirectional RRT-Connect, shortcut smoothing,
-minimum-clearance verification, and `lab-hands/trajectory/v1` JSONL export.
+"""Benchtop motion-planning benchmark for 6-DoF UR5e, 7-DoF Franka Panda, and 2-DoF arms.
+
+Moves a pipette tip from a reagent pickup tube to named SBS 96-well plate wells around
+3D benchtop obstacles (reagent bottle + rack partition), supporting:
+  - 6-DoF `UR5eArm` & 7-DoF `PandaArm` PoE/MDH kinematics, DLS null-space IK, 3D multi-link
+    capsule-vs-AABB continuous swept collision checking, `rrt_connect_se3`, `informed_rrt_star`,
+    and `TOPP-RA` reachability path parameterization (`--arm ur5e` / `--arm panda`),
+  - Backward-compatible 2-DoF `Arm2D` planar RRT / RRT-Connect and `lab-hands/trajectory/v1`
+    JSONL export.
 """
 
 from __future__ import annotations
@@ -20,24 +25,32 @@ if str(_ROOT) not in sys.path:
 
 from lab_hands.collision import (  # noqa: E402
     DEFAULT_OBSTACLES,
+    DEFAULT_SCENE_3D,
     DEFAULT_TUBE_XY,
     BenchScene,
     edge_free as _edge_free,
+    edge_free_se3,
     in_collision as _in_collision,
     min_clearance as _min_clearance,
     path_min_clearance,
+    path_min_clearance_se3,
 )
-from lab_hands.kinematics import DEFAULT_JOINT_LIMITS, Arm2D  # noqa: E402
+from lab_hands.kinematics import DEFAULT_JOINT_LIMITS, Arm2D, PoseSE3  # noqa: E402
+from lab_hands.kinematics_se3 import DEFAULT_PANDA, DEFAULT_UR5E  # noqa: E402
 from lab_hands.labware import PlateGeometry  # noqa: E402
 from lab_hands.planner import (  # noqa: E402
     ik_solutions,
+    informed_rrt_star,
     path_length as length,
     plan_well_tour,
     rrt as _rrt,
     rrt_connect as _rrt_connect,
+    rrt_connect_se3,
     select_ik_branch,
     shortcut as _shortcut,
+    shortcut_se3,
 )
+from lab_hands.toppra import parameterize_toppra  # noqa: E402
 from lab_hands.trajectory import TrajectoryRecord, build_trajectory_record  # noqa: E402
 
 L1, L2 = 0.30, 0.25  # link lengths (m)
@@ -49,6 +62,8 @@ PITCH = 0.009  # SBS 96-well pitch: 9 mm
 ROWS = "ABCDEFGH"
 OBSTACLES = list(DEFAULT_OBSTACLES)  # axis-aligned boxes: xmin, ymin, xmax, ymax
 TUBE = np.array(DEFAULT_TUBE_XY)  # tube position to aspirate from
+
+_EXPORTED_HELPERS = (plan_well_tour, select_ik_branch, edge_free_se3)
 
 
 def _current_arm(clearance_m: Optional[float] = None, margin_m: Optional[float] = None) -> Arm2D:
@@ -145,17 +160,111 @@ def shortcut(path: Sequence[np.ndarray], rng: np.random.Generator, tries: int = 
     return _shortcut(path, rng, tries=tries, arm=_current_arm(), scene=_current_scene())
 
 
+def _run_se3_cobot_showcase(arm_name: str = "ur5e", seeds_per_well: int = 2) -> int:
+    from lab_hands.collision import in_collision_se3
+    from lab_hands.kinematics_se3 import make_panda_arm
+
+    # Benchtop cell mount: Panda base sits at (-0.16, 0, 0) m behind deck so all 96 wells + TUBE
+    # lie in Panda's 0.36..0.46 m sweet-spot reach outside its 88 mm J7 inner dead-zone!
+    arm_se3 = DEFAULT_UR5E if arm_name == "ur5e" else make_panda_arm(base_offset_xyz=(-0.16, 0.0, 0.0))
+    tip_len_m = 0.095  # Mounted 1000 uL micropipette tip clearing 240 mm rack partition
+    scene_3d = DEFAULT_SCENE_3D
+    z_transit = 0.18
+    free_fn = lambda q_cand: not in_collision_se3(
+        q_cand, arm_se3, scene_3d, attached_tip_length_m=tip_len_m
+    )
+
+    start_ik = arm_se3.dls_ik(
+        PoseSE3(xyz=(float(TUBE[0]), float(TUBE[1]), z_transit), rpy=(0.0, 0.0, 0.0)),
+        attached_tip_length_m=tip_len_m,
+        collision_free_fn=free_fn,
+    )
+    if not start_ik.success:
+        print(f"error: {arm_se3.name} start DLS IK failed at {TUBE}", file=sys.stderr)
+        return 1
+    q_start = start_ik.q
+
+    targets = ["A1", "A12", "D6", "F5", "H1", "H12"]
+    conn_times, star_gains, topp_durs, clear_mms = [], [], [], []
+    total = 0
+    ok = 0
+
+    for w in targets:
+        txy = well_xy(w)
+        goal_ik = arm_se3.dls_ik(
+            PoseSE3(xyz=(float(txy[0]), float(txy[1]), z_transit), rpy=(0.0, 0.0, 0.0)),
+            q_seed=q_start,
+            attached_tip_length_m=tip_len_m,
+            collision_free_fn=free_fn,
+        )
+        if not goal_ik.success:
+            return 1
+        q_goal = goal_ik.q
+        for sd in range(seeds_per_well):
+            total += 1
+            rng = np.random.default_rng(sd)
+            t0 = time.perf_counter()
+            raw = rrt_connect_se3(
+                q_start, q_goal, rng, arm=arm_se3, scene_3d=scene_3d, attached_tip_length_m=tip_len_m
+            )
+            if raw is None:
+                continue
+            sp = shortcut_se3(
+                raw, rng, arm=arm_se3, scene_3d=scene_3d, attached_tip_length_m=tip_len_m
+            )
+            conn_times.append((time.perf_counter() - t0) * 1000.0)
+            cl_mm = path_min_clearance_se3(sp, arm_se3, scene_3d, attached_tip_length_m=tip_len_m) * 1000.0
+            if cl_mm < 5.0 - 1e-6:
+                return 1
+            clear_mms.append(cl_mm)
+            topp = parameterize_toppra(
+                sp,
+                qd_max=arm_se3.qd_max,
+                qdd_max=arm_se3.qdd_max,
+                qddd_max=arm_se3.qddd_max,
+            )
+            topp_durs.append(topp.duration_s)
+            if sd == 0 and w in ("A12", "H12"):
+                ir = informed_rrt_star(
+                    q_start,
+                    q_goal,
+                    rng,
+                    arm=arm_se3,
+                    scene_3d=scene_3d,
+                    iters=70,
+                    attached_tip_length_m=tip_len_m,
+                )
+                if ir is not None and ir.initial_cost_rad > 1e-6:
+                    star_gains.append(100.0 * (ir.initial_cost_rad - ir.best_cost_rad) / ir.initial_cost_rad)
+            ok += 1
+
+    if ok != total:
+        return 1
+    mean_gain = float(np.mean(star_gains)) if star_gains else 0.0
+    print(
+        f"6-DoF/7-DoF SE(3) cobot ({arm_se3.name.upper()}, {arm_se3.dof}-DoF): {ok}/{total} (100.0%), "
+        f"RRT-Connect mean {np.mean(conn_times):.1f} ms, Informed-RRT* cost reduction {mean_gain:.1f}%, "
+        f"TOPP-RA mean cycle {np.mean(topp_durs):.2f} s, min 3D capsule clearance {np.min(clear_mms):.1f} mm"
+    )
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--planner", choices=["rrt", "rrt_connect"], default="rrt")
+    ap.add_argument("--planner", choices=["rrt", "rrt_connect", "informed_rrt_star"], default="rrt")
+    ap.add_argument("--arm", choices=["2d_and_ur5e", "ur5e", "panda", "2d"], default="2d_and_ur5e")
     ap.add_argument("--seeds", type=int, default=10, help="Number of RNG seeds per target well")
     ap.add_argument("--out-jsonl", type=Path, default=None, help="Optional JSONL path for lab-hands/trajectory/v1 records")
     args = ap.parse_args(argv)
 
+    print("well 65 ->", well_name(65, "row"), "(row-major),", well_name(65, "col"), "(column-major)")
+
+    if args.arm in ("ur5e", "panda") and args.out_jsonl is None:
+        return _run_se3_cobot_showcase(arm_name=args.arm, seeds_per_well=max(1, min(args.seeds, 5)))
+
     arm = _current_arm()
     scene = _current_scene()
 
-    print("well 65 ->", well_name(65, "row"), "(row-major),", well_name(65, "col"), "(column-major)")
     starts = ik_solutions(TUBE, arm=arm, scene=scene)
     if not starts:
         print("error: start configuration at TUBE is unreachable or in collision", file=sys.stderr)
@@ -167,7 +276,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     records: List[TrajectoryRecord] = []
     targets = ["A1", "A12", "D6", "E5", "F5", "H1", "H12", "C9", "G3", "B7"]
     trials = 0
-    solve_fn = _rrt_connect if args.planner == "rrt_connect" else _rrt
 
     for w in targets:
         target_xy = well_xy(w)
@@ -180,7 +288,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             trials += 1
             rng = np.random.default_rng(seed)
             t0 = time.perf_counter()
-            path = solve_fn(start, goals, rng, arm=arm, scene=scene)
+            if args.planner == "informed_rrt_star":
+                ir = informed_rrt_star(start, goals[0], rng, arm=arm, scene=scene, iters=300)
+                path = None if ir is None else ir.path
+            elif args.planner == "rrt_connect":
+                path = _rrt_connect(start, goals, rng, arm=arm, scene=scene)
+            else:
+                path = _rrt(start, goals, rng, arm=arm, scene=scene)
+
             if path is None:
                 continue
             sp = _shortcut(path, rng, arm=arm, scene=scene)
@@ -230,6 +345,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"(p95 {np.percentile(smooth_lens, 95):.2f} rad, max {np.max(smooth_lens):.2f} rad)"
     )
     print(f"minimum link-obstacle clearance: min {np.min(clearances) * 1000:.1f} mm, mean {np.mean(clearances) * 1000:.1f} mm")
+
+    if args.arm == "2d_and_ur5e":
+        rc6 = _run_se3_cobot_showcase(arm_name="ur5e", seeds_per_well=1)
+        if rc6 != 0:
+            raise SystemExit(rc6)
     return 0
 
 

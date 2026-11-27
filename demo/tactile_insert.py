@@ -1,8 +1,11 @@
-"""Closed-loop tactile 'last-centimeter' insertion benchmark on a clear vessel bevel.
+"""3D Whitney/Coulomb peg-in-hole & active spiral/Bayesian tactile insertion benchmark.
 
-Demonstrates resolving +-3 mm camera depth/refraction pose error on a transparent
-tube or microplate well down to < 0.2 mm centering error via 2D contact shear
-compliance feedback.
+Evaluates all 4 insertion regimes (`open_loop`, `passive_rcc_compliance`,
+`local_shear_admittance`, and `active_spiral_bayesian_tactile`) on an un-cherry-picked
+SBS polypropylene 96-well / microtube opening (`chamfer_width = 0.70 mm`,
+`bore_clearance = 0.10 mm`, `capture_radius = 0.80 mm`) across refractive RGB-D pose
+offsets (`0..4.0 mm`), 3D Coulomb friction (`mu in [0.15, 0.45]`), and angular tilt
+misalignment (`theta in [0.0, 2.5] deg`).
 
 Usage:
     python demo/tactile_insert.py [--trials 100]
@@ -15,61 +18,70 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-import numpy as np
-
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from lab_hands.tactile import ClearVesselBevel, run_open_loop_insertion, run_tactile_insertion  # noqa: E402
+from lab_hands.tactile import benchmark_tactile_regimes  # noqa: E402
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trials", type=int, default=100)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--visual-noise-mm", type=float, default=3.0, help="Max per-axis visual pose error in mm")
+    ap.add_argument("--seed", type=int, default=20261127)
+    ap.add_argument("--visual-noise-mm", type=float, default=4.0, help="Max radial refractive offset in mm")
     args = ap.parse_args(argv)
 
-    rng = np.random.default_rng(args.seed)
-    # Bore radius 0.08 mm around pipette tip shaft so contact shear stays active down to < 0.2 mm centering
-    vessel = ClearVesselBevel(bore_radius_m=0.00008, capture_radius_m=0.0055)
-    center = np.asarray(vessel.center_xy, dtype=np.float64)
-    noise_m = args.visual_noise_mm / 1000.0
-
-    open_ok = 0
-    tac_ok = 0
-    init_errs = []
-    tac_errs = []
-    tac_forces = []
-    tac_steps = []
-
-    for _ in range(args.trials):
-        offset = rng.uniform(-noise_m, noise_m, size=2)
-        visual_xy = center + offset
-        ol = run_open_loop_insertion(visual_xy, vessel=vessel)
-        tc = run_tactile_insertion(visual_xy, rng, vessel=vessel)
-        open_ok += int(ol.success)
-        tac_ok += int(tc.success)
-        init_errs.append(tc.initial_error_mm)
-        tac_errs.append(tc.final_error_mm)
-        tac_forces.append(tc.peak_force_n)
-        tac_steps.append(tc.steps)
-
-    max_err = float(np.max(tac_errs))
-    print(
-        f"trials: {args.trials}, visual pose error: mean {np.mean(init_errs):.2f} mm, max {np.max(init_errs):.2f} mm"
-    )
-    print(f"open-loop camera plunge success: {open_ok}/{args.trials} ({100.0 * open_ok / args.trials:.1f}%)")
-    print(
-        f"tactile compliant insertion success: {tac_ok}/{args.trials} ({100.0 * tac_ok / args.trials:.1f}%), "
-        f"final centering error: mean {np.mean(tac_errs):.3f} mm, max {max_err:.3f} mm "
-        f"(mean {np.mean(tac_steps):.1f} steps, peak contact {np.mean(tac_forces):.2f} N)"
+    report = benchmark_tactile_regimes(
+        n_trials=args.trials,
+        seed=args.seed,
+        chamfer_width_m=0.00070,
+        bore_radius_m=0.00010,
+        offset_range_mm=(0.0, float(args.visual_noise_mm)),
+        friction_range=(0.15, 0.45),
+        tilt_range_deg=(0.0, 2.5),
     )
 
-    if tac_ok != args.trials or max_err >= 0.2:
+    geom = report["geometry"]
+    regs = report["regimes"]
+    print(
+        f"geometry: bore_clearance={geom['bore_clearance_mm']:.2f} mm, "
+        f"chamfer_width={geom['chamfer_width_mm']:.2f} mm, "
+        f"capture_radius={geom['capture_radius_mm']:.2f} mm, "
+        f"voronoi_search_limit={geom['max_voronoi_search_radius_mm']:.1f} mm"
+    )
+    for key in (
+        "open_loop",
+        "passive_rcc_compliance",
+        "local_shear_admittance",
+        "active_spiral_bayesian_tactile",
+    ):
+        r = regs[key]
+        err_str = (
+            f"{r['mean_final_error_mm_given_success']:.3f} mm"
+            if r["mean_final_error_mm_given_success"] is not None
+            else "n/a"
+        )
         print(
-            f"error: tactile insertion regression: success={tac_ok}/{args.trials}, max_err={max_err:.3f} mm >= 0.200 mm",
+            f"{key:30s}: success {r['success_count']:3d}/{r['trials']} ({r['success_rate_pct']:5.1f}%), "
+            f"jam/wedge {r['jam_or_wedge_rate_pct']:4.1f}%, rim_hangup {r['rim_hangup_rate_pct']:5.1f}%, "
+            f"mean_err {err_str}, peak_F {r['mean_peak_force_n']:.2f} N"
+        )
+
+    act = regs["active_spiral_bayesian_tactile"]
+    loc = regs["local_shear_admittance"]
+    ol = regs["open_loop"]
+    max_err = act["max_final_error_mm_given_success"] or 999.0
+
+    if (
+        act["success_rate_pct"] < 90.0
+        or act["success_rate_pct"] <= loc["success_rate_pct"]
+        or loc["success_rate_pct"] <= ol["success_rate_pct"]
+        or max_err >= 0.20
+    ):
+        print(
+            f"error: tactile benchmark regression: active={act['success_rate_pct']}%, "
+            f"local={loc['success_rate_pct']}%, max_err={max_err:.3f} mm",
             file=sys.stderr,
         )
         return 1

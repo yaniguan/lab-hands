@@ -80,26 +80,51 @@ def test_collision_free_rrt_a1_to_h12() -> None:
     assert "5.0 mm" in brt["first_principles"]
 
 
-def test_measured_clearance_reported_truthfully_issue_30() -> None:
-    pkt = {"start_well": "TUBE", "target_well": "H12", "clearance_mm": 25.0, "seed": 0}
-    out = process_packet(pkt)
-    assert out["halted"] is False
+def test_requested_clearance_enforced_and_measured_truthfully_issue_30_35() -> None:
+    # Check requests of 5, 8.5, 25, 50, and 500 mm for TUBE -> H12, seed 0 (#35 acceptance criteria)
+    for req_mm in (5.0, 8.5, 25.0, 50.0, 500.0):
+        pkt = {
+            "start_well": "TUBE",
+            "target_well": "H12",
+            "clearance_mm": req_mm,
+            "seed": 0,
+            "require_tactile_insert": False,
+        }
+        out = process_packet(pkt)
+        manip = out["manipulation"]
+        assert manip["requested_min_clearance_mm"] == req_mm
+        if not out["halted"]:
+            assert out["trace"][-1]["status"] == "PASS"
+            assert manip["measured_min_clearance_mm"] >= manip["requested_min_clearance_mm"]
+            assert manip["clearance_mm"] == manip["measured_min_clearance_mm"]
+        else:
+            assert out["halt_reason"] == "L1_HANDS_COLLISION_OR_CLEARANCE_BLOCK"
+            assert out["trace"][-1]["status"] == "BLOCK"
+            assert "requested_clearance_mm=" in out["trace"][-1]["summary"]
+            assert "best_measured_clearance_mm=" in out["trace"][-1]["summary"]
 
-    s_xy = autolab_wire._resolve_target_xy("TUBE", DEFAULT_SCENE)
-    t_xy = autolab_wire._resolve_target_xy("H12", DEFAULT_SCENE)
-    assert s_xy is not None and t_xy is not None
-    res = autolab_wire._plan_collision_free_move(s_xy, t_xy, seed=0, arm=DEFAULT_ARM, scene=DEFAULT_SCENE)
-    assert res is not None
-    actual_path, measured_mm = res
-    expected_mm = round(path_min_clearance(actual_path) * 1000.0, 3)
+    # Default 8.5 mm request for TUBE -> H12, seed 0 passes with >= 8.5 mm measured clearance
+    out_85 = process_packet(
+        {"start_well": "TUBE", "target_well": "H12", "clearance_mm": 8.5, "seed": 0, "require_tactile_insert": False}
+    )
+    assert out_85["halted"] is False
+    assert out_85["manipulation"]["measured_min_clearance_mm"] >= 8.5
 
-    manip = out["manipulation"]
-    assert manip["requested_min_clearance_mm"] == 25.0
-    assert manip["measured_min_clearance_mm"] == pytest.approx(expected_mm, abs=1e-3)
-    assert manip["clearance_mm"] == pytest.approx(expected_mm, abs=1e-3)
-    assert manip["clearance_mm"] < 25.0
-    assert manip["clearance_mm"] >= 5.0
-    assert round(measured_mm, 3) == expected_mm
+    # Impossible 500 mm request halts cleanly with HALT_REASON
+    out_500 = process_packet(
+        {"start_well": "TUBE", "target_well": "H12", "clearance_mm": 500.0, "seed": 0, "require_tactile_insert": False}
+    )
+    assert out_500["halted"] is True
+    assert out_500["halt_reason"] == "L1_HANDS_COLLISION_OR_CLEARANCE_BLOCK"
+
+
+@pytest.mark.parametrize("field_name", ["seed", "clearance_mm", "capsule_radius_m", "bevel_capture_radius_m"])
+@pytest.mark.parametrize("bad_value", ["abc", None, float("nan"), [1]])
+def test_bad_numeric_packet_fields_halt_without_raising_issue_35(field_name: str, bad_value: object) -> None:
+    out = process_packet({"start_well": "A1", "target_well": "H12", field_name: bad_value})
+    assert out["halted"] is True
+    assert out["halt_reason"] == "L1_HANDS_COLLISION_OR_CLEARANCE_BLOCK"
+    assert field_name in out["trace"][-1]["summary"]
 
 
 def test_tactile_bevel_recovery_and_rim_hangup_seal_block_issue_30() -> None:

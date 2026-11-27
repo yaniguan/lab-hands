@@ -30,10 +30,37 @@ from .collision import (
     min_clearance,
     path_min_clearance,
 )
-from .kinematics import DEFAULT_ARM, DEFAULT_ARM_SE3, Arm2D, ArmSE3, PoseSE3, wrap_angle
+from .kinematics import (
+    DEFAULT_ARM,
+    DEFAULT_ARM_SE3,
+    Arm2D,
+    ArmSE3,
+    FrankaRobotModel,
+    PoseSE3,
+    UR5eRobotModel,
+    _rot_to_rpy,
+    get_robot_model_se3,
+    wrap_angle,
+)
 from .labware import DeckLayout, PlateGeometry
 from .planner import select_ik_branch
-from .trajectory import PickPlacePlan3D, parameterize_path, plan_3d_pick_place
+from .trajectory import (
+    MIN_GRAVITY_SLOSH_BOND_NUMBER,
+    SLOSH_BESSEL_XI_11,
+    SLOSH_GRAVITY_M_S2,
+    LeRobotFrameTable,
+    OpentronsWaypointTrajectory,
+    PickPlacePlan3D,
+    extract_opentrons_runlog_trajectory,
+    parameterize_path,
+    plan_3d_pick_place,
+    plan_to_opentrons_trajectory,
+    slosh_bond_number,
+    slosh_natural_frequency,
+    trajectory_to_lerobot_tensors,
+    validate_lerobot_frame_tensors,
+    validate_opentrons_trajectory,
+)
 
 DatasetModality = Literal["kinematics", "transparent_depth", "visuo_tactile", "wetlab_video"]
 VALID_MODALITIES: Tuple[DatasetModality, ...] = (
@@ -43,8 +70,8 @@ VALID_MODALITIES: Tuple[DatasetModality, ...] = (
     "wetlab_video",
 )
 
-_GRAVITY_M_S2: float = 9.80665
-_BESSEL_XI_11: float = 1.841
+_GRAVITY_M_S2: float = SLOSH_GRAVITY_M_S2
+_BESSEL_XI_11: float = SLOSH_BESSEL_XI_11
 _MIN_OBSTACLE_CLEARANCE_MM: float = 5.0
 _DEFAULT_96_CORNER_OFFSETS_XY: Tuple[Tuple[float, float], ...] = (
     (0.0495, 0.0315),
@@ -343,7 +370,7 @@ def check_commercial_compliance(dataset_ids: Iterable[str]) -> Tuple[bool, List[
 
 @dataclass(frozen=True)
 class LeRobotEpisode:
-    """Normalized LeRobot trajectory episode mapped onto a 6-DOF `ArmSE3` joint configuration array."""
+    """Normalized LeRobot trajectory episode with canonical v2.1 / v3.0 frame-tabular tensors."""
 
     dataset_id: str
     episode_index: int
@@ -354,6 +381,20 @@ class LeRobotEpisode:
     q6_se3: np.ndarray
     gripper: Optional[np.ndarray] = None
     task_index: int = 0
+    frame_indices: Optional[np.ndarray] = None
+    next_done: Optional[np.ndarray] = None
+    robot_type: Optional[str] = None
+    arm_joints_rad: Optional[np.ndarray] = None
+    state_names: Optional[Tuple[str, ...]] = None
+    cartesian_positions: Optional[np.ndarray] = None
+
+    @property
+    def arm_joints(self) -> np.ndarray:
+        return self.arm_joints_rad if self.arm_joints_rad is not None else self.q6_se3
+
+    @property
+    def n_arm_joints(self) -> int:
+        return int(self.arm_joints.shape[1])
 
     @property
     def n_frames(self) -> int:
@@ -364,6 +405,84 @@ class LeRobotEpisode:
         if self.timestamps_s.size < 2:
             return 0.0
         return float(self.timestamps_s[-1] - self.timestamps_s[0])
+
+    @property
+    def frame_table(self) -> LeRobotFrameTable:
+        """Canonical LeRobot frame-tabular tensor bundle preserving dataset state/action dimensionality."""
+        return self._build_frame_table(single_arm_7d=False)
+
+    def _build_frame_table(self, *, single_arm_7d: bool = False) -> LeRobotFrameTable:
+        t_len = self.n_frames
+        ts_f32 = np.asarray(self.timestamps_s, dtype=np.float32).reshape(t_len)
+        ts_f32 = ts_f32 - float(ts_f32[0])
+
+        if self.frame_indices is not None and self.frame_indices.size == t_len:
+            f_idx = np.asarray(self.frame_indices, dtype=np.int64).reshape(t_len)
+        else:
+            f_idx = np.arange(t_len, dtype=np.int64)
+
+        ep_idx = np.full(t_len, int(self.episode_index), dtype=np.int64)
+        if self.next_done is not None and self.next_done.size == t_len:
+            done = np.asarray(self.next_done, dtype=np.bool_).reshape(t_len).copy()
+            done[-1] = True
+        else:
+            done = np.zeros(t_len, dtype=np.bool_)
+            done[-1] = True
+
+        if single_arm_7d:
+            grip_col = (
+                np.asarray(self.gripper, dtype=np.float32).reshape(t_len, 1)
+                if self.gripper is not None
+                else np.zeros((t_len, 1), dtype=np.float32)
+            )
+            obs_f32 = np.concatenate(
+                [np.asarray(self.q6_se3, dtype=np.float32), grip_col],
+                axis=1,
+            ).astype(np.float32, copy=False)
+            if self.actions is not None and self.actions.shape[1] >= 7:
+                act_f32 = np.asarray(self.actions[:, :7], dtype=np.float32)
+            elif self.actions is not None and self.actions.shape[1] == 6:
+                g_act = grip_col if t_len == 1 else np.vstack([grip_col[1:], grip_col[-1:]])
+                act_f32 = np.concatenate(
+                    [np.asarray(self.actions, dtype=np.float32), g_act],
+                    axis=1,
+                ).astype(np.float32, copy=False)
+            else:
+                act_f32 = (
+                    obs_f32.copy()
+                    if t_len == 1
+                    else np.vstack([obs_f32[1:], obs_f32[-1:]]).astype(np.float32, copy=False)
+                )
+        else:
+            obs_f32 = np.asarray(self.joint_positions_rad, dtype=np.float32)
+            if obs_f32.ndim == 1:
+                obs_f32 = obs_f32[:, None]
+            if self.actions is not None:
+                act_f32 = np.asarray(self.actions, dtype=np.float32)
+                if act_f32.ndim == 1:
+                    act_f32 = act_f32[:, None]
+            else:
+                act_f32 = (
+                    obs_f32.copy()
+                    if t_len == 1
+                    else np.vstack([obs_f32[1:], obs_f32[-1:]]).astype(np.float32, copy=False)
+                )
+
+        return LeRobotFrameTable(
+            observation_state=obs_f32,
+            action=act_f32,
+            timestamp=ts_f32,
+            frame_index=f_idx,
+            episode_index=ep_idx,
+            next_done=done,
+        )
+
+    def to_lerobot_tensors(self, *, single_arm_7d: bool = False) -> Dict[str, np.ndarray]:
+        """Return validated HuggingFace LeRobot v2.1 / v3.0 frame-tabular tensors:
+        `observation.state` (`float32 (T, D)`), `action` (`float32 (T, D)`), `timestamp` (`float32 (T,)`),
+        `frame_index` (`int64 (T,)`), `episode_index` (`int64 (T,)`), and `next.done` (`bool (T,)`).
+        """
+        return self._build_frame_table(single_arm_7d=single_arm_7d).to_dict()
 
 
 def _read_parquet_rows(path: Path) -> List[Dict[str, Any]]:
@@ -387,6 +506,51 @@ def _read_parquet_rows(path: Path) -> List[Dict[str, Any]]:
         ) from exc
 
 
+def _extract_lerobot_info(
+    source: str | Path | Sequence[Mapping[str, Any]] | Mapping[str, Any],
+    explicit_info: Optional[Mapping[str, Any] | str | Path] = None,
+) -> Dict[str, Any]:
+    """Load optional LeRobot `meta/info.json` metadata (`robot_type`, feature `names`, `fps`)."""
+    if explicit_info is not None:
+        if isinstance(explicit_info, (str, Path)):
+            return dict(json.loads(Path(explicit_info).read_text(encoding="utf-8")))
+        return dict(explicit_info)
+
+    if isinstance(source, Mapping):
+        for key in ("info", "meta"):
+            val = source.get(key)
+            if isinstance(val, Mapping):
+                return dict(val)
+        return {}
+
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        if path.suffix.lower() == ".json":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, Mapping):
+                    for key in ("info", "meta"):
+                        val = payload.get(key)
+                        if isinstance(val, Mapping):
+                            return dict(val)
+            except (OSError, ValueError):
+                pass
+        for cand_info in (
+            path.parent / "info.json",
+            path.parent / "meta" / "info.json",
+            path.parent.parent / "meta" / "info.json",
+            path.parent.parent.parent / "meta" / "info.json",
+        ):
+            if cand_info.is_file():
+                try:
+                    loaded = json.loads(cand_info.read_text(encoding="utf-8"))
+                    if isinstance(loaded, Mapping):
+                        return dict(loaded)
+                except (OSError, ValueError):
+                    pass
+    return {}
+
+
 def _normalize_lerobot_rows(
     source: str | Path | Sequence[Mapping[str, Any]] | Mapping[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -405,7 +569,7 @@ def _normalize_lerobot_rows(
 
     if isinstance(source, Mapping):
         if "rows" in source and isinstance(source["rows"], list):
-            # HuggingFace datasets-server /rows format: {"rows": [{"row_idx": 0, "row": {...}}, ...]}
+            # HuggingFace datasets-server /rows or fixture bundle: {"rows": [{"row_idx": 0, "row": {...}}, ...]}
             unwrapped: List[Dict[str, Any]] = []
             for item in source["rows"]:
                 if isinstance(item, Mapping) and "row" in item and isinstance(item["row"], Mapping):
@@ -414,11 +578,11 @@ def _normalize_lerobot_rows(
                     unwrapped.append(dict(item))
             return unwrapped
         # Column-oriented dict {"observation.state": [...], "timestamp": [...]}
-        keys = list(source.keys())
-        if not keys:
+        col_keys = [k for k, v in source.items() if k not in {"info", "meta"} and isinstance(v, Sequence) and not isinstance(v, (str, bytes))]
+        if not col_keys:
             return []
-        n = len(source[keys[0]])
-        return [{k: source[k][i] for k in keys} for i in range(n)]
+        n = len(source[col_keys[0]])
+        return [{k: source[k][i] for k in col_keys} for i in range(n)]
 
     return [dict(r) for r in source]
 
@@ -428,8 +592,10 @@ def load_lerobot_episode(
     *,
     episode_index: Optional[int] = None,
     dataset_id: str = "lerobot",
-    arm_joint_slice: Tuple[int, int] = (0, 6),
-    gripper_index: Optional[int] = 6,
+    robot_type: Optional[str] = None,
+    info: Optional[Mapping[str, Any] | str | Path] = None,
+    arm_joint_slice: Optional[Tuple[int, int]] = None,
+    gripper_index: Optional[int] = None,
     default_fps: float = 50.0,
     joint_scale: float = 1.0,
     joint_offsets_rad: Optional[Sequence[float]] = None,
@@ -437,10 +603,8 @@ def load_lerobot_episode(
     """Load a LeRobot v2/v3 `.parquet`, `.jsonl`, `.json`, or HF `/rows` trajectory into `LeRobotEpisode`."""
     if default_fps <= 0.0:
         raise ValueError(f"default_fps must be > 0, got {default_fps}")
-    s_lo, s_hi = int(arm_joint_slice[0]), int(arm_joint_slice[1])
-    if s_lo < 0 or s_hi <= s_lo or (s_hi - s_lo) > 6:
-        raise ValueError(f"arm_joint_slice must select 1..6 joints, got {arm_joint_slice!r}")
 
+    info_dict = _extract_lerobot_info(source, info)
     rows = _normalize_lerobot_rows(source)
     if not rows:
         raise ValueError("LeRobot source contains zero rows")
@@ -462,9 +626,13 @@ def load_lerobot_episode(
         ep_rows = sorted(ep_rows, key=lambda r: int(r["frame_index"]))
 
     state_key: Optional[str] = None
-    for cand in ("observation.state", "state", "qpos", "joint_positions"):
-        if cand in ep_rows[0]:
-            state_key = cand
+    for cand in ("observation.state.joint_position", "observation.state", "state", "qpos", "joint_positions"):
+        if cand in ep_rows[0] and ep_rows[0][cand] is not None:
+            # Prefer full `observation.state` unless `observation.state` is missing
+            if cand == "observation.state.joint_position" and "observation.state" in ep_rows[0]:
+                state_key = "observation.state"
+            else:
+                state_key = cand
             break
     if state_key is None:
         raise ValueError(
@@ -490,6 +658,7 @@ def load_lerobot_episode(
             actions = actions[:, None]
 
     n_frames, state_dim = states.shape
+    eff_default_fps = float(info_dict.get("fps", default_fps) or default_fps)
     if "timestamp" in ep_rows[0] or "time_s" in ep_rows[0]:
         t_key = "timestamp" if "timestamp" in ep_rows[0] else "time_s"
         timestamps = np.asarray([float(r[t_key]) for r in ep_rows], dtype=np.float64)
@@ -500,31 +669,83 @@ def load_lerobot_episode(
             dtype=np.float64,
         )
         frame_indices = frame_indices - float(frame_indices[0])
-        timestamps = frame_indices / float(default_fps)
+        timestamps = frame_indices / eff_default_fps
 
     if n_frames >= 2:
         diffs = np.diff(timestamps)
         pos_diffs = diffs[diffs > 1e-9]
-        fps = float(1.0 / np.median(pos_diffs)) if pos_diffs.size > 0 else float(default_fps)
+        fps = float(1.0 / np.median(pos_diffs)) if pos_diffs.size > 0 else eff_default_fps
     else:
-        fps = float(default_fps)
+        fps = eff_default_fps
+
+    resolved_robot_type: Optional[str] = None
+    for cand_rt in (robot_type, info_dict.get("robot_type"), ep_rows[0].get("robot_type")):
+        if cand_rt is not None and str(cand_rt).strip():
+            resolved_robot_type = str(cand_rt).strip()
+            break
+
+    state_names: Optional[Tuple[str, ...]] = None
+    features_meta = info_dict.get("features")
+    if isinstance(features_meta, Mapping):
+        feat_entry = features_meta.get(state_key) or features_meta.get("observation.state") or features_meta.get("state")
+        if isinstance(feat_entry, Mapping):
+            raw_names = feat_entry.get("names")
+            if isinstance(raw_names, list) and all(isinstance(x, str) for x in raw_names):
+                state_names = tuple(raw_names)
+            elif isinstance(raw_names, Mapping):
+                for sub_v in raw_names.values():
+                    if isinstance(sub_v, list) and all(isinstance(x, str) for x in sub_v):
+                        state_names = tuple(sub_v)
+                        break
+
+    robot_model = get_robot_model_se3(resolved_robot_type)
+    if arm_joint_slice is not None:
+        s_lo, s_hi = int(arm_joint_slice[0]), int(arm_joint_slice[1])
+        if s_lo < 0 or s_hi <= s_lo or (s_hi - s_lo) > 7:
+            raise ValueError(f"arm_joint_slice must select 1..7 joints, got {arm_joint_slice!r}")
+    elif robot_model is not None:
+        s_lo, s_hi = 0, int(robot_model.n_joints)
+    else:
+        s_lo, s_hi = 0, min(6, state_dim)
 
     eff_hi = min(state_dim, s_hi)
     if s_lo >= state_dim:
-        raise ValueError(f"arm_joint_slice {arm_joint_slice} out of bounds for state_dim={state_dim}")
-    sliced = states[:, s_lo:eff_hi]
-    q6 = np.zeros((n_frames, 6), dtype=np.float64)
-    q6[:, : sliced.shape[1]] = sliced
+        raise ValueError(f"arm_joint_slice {(s_lo, s_hi)} out of bounds for state_dim={state_dim}")
+    arm_joints = states[:, s_lo:eff_hi].copy()
 
     if joint_offsets_rad is not None:
         offsets = np.asarray(joint_offsets_rad, dtype=np.float64)
-        if offsets.shape != (6,):
-            raise ValueError(f"joint_offsets_rad must have shape (6,), got {offsets.shape}")
-        q6 = q6 + offsets[None, :]
+        if offsets.shape != (arm_joints.shape[1],):
+            raise ValueError(
+                f"joint_offsets_rad must have shape ({arm_joints.shape[1]},), got {offsets.shape}"
+            )
+        arm_joints = arm_joints + offsets[None, :]
 
+    q6 = np.zeros((n_frames, 6), dtype=np.float64)
+    q6[:, : min(6, arm_joints.shape[1])] = arm_joints[:, : min(6, arm_joints.shape[1])]
+
+    eff_grip_idx = gripper_index if gripper_index is not None else (eff_hi if eff_hi < state_dim else None)
     gripper: Optional[np.ndarray] = None
-    if gripper_index is not None and 0 <= int(gripper_index) < state_dim:
-        gripper = states[:, int(gripper_index)].copy()
+    if eff_grip_idx is not None and 0 <= int(eff_grip_idx) < state_dim:
+        gripper = states[:, int(eff_grip_idx)].copy()
+
+    cart_arr: Optional[np.ndarray] = None
+    for c_key in ("observation.state.cartesian_position", "observation.state.cartesian"):
+        if c_key in ep_rows[0] and ep_rows[0][c_key] is not None:
+            cart_arr = np.asarray([r[c_key] for r in ep_rows], dtype=np.float64)
+            break
+
+    frame_idx_arr = np.asarray(
+        [int(r.get("frame_index", idx)) for idx, r in enumerate(ep_rows)],
+        dtype=np.int64,
+    )
+    done_arr = np.zeros(n_frames, dtype=np.bool_)
+    for idx, r in enumerate(ep_rows):
+        if "next.done" in r and r["next.done"] is not None:
+            done_arr[idx] = bool(r["next.done"])
+        elif "done" in r and r["done"] is not None:
+            done_arr[idx] = bool(r["done"])
+    done_arr[-1] = True
 
     task_idx = int(ep_rows[0].get("task_index", 0) or 0)
     return LeRobotEpisode(
@@ -537,6 +758,12 @@ def load_lerobot_episode(
         q6_se3=q6,
         gripper=gripper,
         task_index=task_idx,
+        frame_indices=frame_idx_arr,
+        next_done=done_arr,
+        robot_type=resolved_robot_type,
+        arm_joints_rad=arm_joints,
+        state_names=state_names,
+        cartesian_positions=cart_arr,
     )
 
 
@@ -644,28 +871,59 @@ def load_finebio_annotations(
             raise ValueError(f"Empty FineBio annotation file: {path}")
         if suffix in {".txt", ".tsv", ".csv"}:
             default_take = take_id or path.stem
-            delim = "\t" if "\t" in text.splitlines()[0] else ("," if suffix == ".csv" else None)
-            for line in text.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                parts = [p.strip() for p in (stripped.split(delim) if delim else stripped.split())]
-                if parts[0].lower() in {"start", "start_s", "start_sec"}:
-                    continue
-                if len(parts) < 4:
-                    raise ValueError(f"Expected >= 4 columns in FineBio transcript line: {line!r}")
-                entry: Dict[str, Any] = {
-                    "segment": [float(parts[0]), float(parts[1])],
-                    "verb_label": parts[2],
-                    "manipulated_label": parts[3],
-                    "affected_label": parts[4] if len(parts) >= 5 else None,
-                    "hand_label": parts[5] if len(parts) >= 6 else "right",
-                }
-                if len(parts) >= 7 and parts[6]:
-                    entry["source_ref"] = parts[6]
-                if len(parts) >= 8 and parts[7]:
-                    entry["target_ref"] = parts[7]
-                raw_items.append((default_take, entry))
+            non_comment = [
+                ln.strip()
+                for ln in text.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            # Detect official FineBio step_segmentation/data/groundTruth/*.txt (1 frame label per line at 30 fps)
+            if non_comment and all(len(ln.split()) == 1 and ("," not in ln) for ln in non_comment):
+                fps_gt = 30.0
+                run_label = non_comment[0]
+                run_start = 0
+                for f_i in range(1, len(non_comment) + 1):
+                    cur_lbl = non_comment[f_i] if f_i < len(non_comment) else "__END__"
+                    if cur_lbl != run_label:
+                        tok_l = run_label.lower()
+                        if tok_l not in {"background", "none", "idle"}:
+                            verb_g = "move" if "shake" in tok_l else ("aspirate" if ("aspirate" in tok_l or "remove" in tok_l) else "dispense")
+                            manip_g = "96_well_plate" if "shake_plate" in tok_l else "micropipette"
+                            aff_g = "microtube" if "tube" in tok_l else "96_well_plate"
+                            step_entry: Dict[str, Any] = {
+                                "segment": [round(run_start / fps_gt, 4), round(f_i / fps_gt, 4)],
+                                "verb_label": verb_g,
+                                "manipulated_label": manip_g,
+                                "affected_label": aff_g,
+                                "hand_label": "right",
+                            }
+                            if not raw_items and "eppendorf" in eff_deck.labware_by_alias:
+                                step_entry["source_ref"] = "eppendorf:A1"
+                            raw_items.append((default_take, step_entry))
+                        run_label = cur_lbl
+                        run_start = f_i
+            else:
+                delim = "\t" if "\t" in text.splitlines()[0] else ("," if suffix == ".csv" else None)
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in (stripped.split(delim) if delim else stripped.split())]
+                    if parts[0].lower() in {"start", "start_s", "start_sec"}:
+                        continue
+                    if len(parts) < 4:
+                        raise ValueError(f"Expected >= 4 columns in FineBio transcript line: {line!r}")
+                    entry: Dict[str, Any] = {
+                        "segment": [float(parts[0]), float(parts[1])],
+                        "verb_label": parts[2],
+                        "manipulated_label": parts[3],
+                        "affected_label": parts[4] if len(parts) >= 5 else None,
+                        "hand_label": parts[5] if len(parts) >= 6 else "right",
+                    }
+                    if len(parts) >= 7 and parts[6]:
+                        entry["source_ref"] = parts[6]
+                    if len(parts) >= 8 and parts[7]:
+                        entry["target_ref"] = parts[7]
+                    raw_items.append((default_take, entry))
         elif suffix == ".jsonl":
             default_take = take_id or path.stem
             for line in text.splitlines():
@@ -751,7 +1009,8 @@ def load_finebio_annotations(
             if verb in {"insert", "attach", "mount", "take_tip"} and (
                 (affected and "tip" in affected) or dst_ref.startswith("tips:")
             ):
-                cur_tip = 0.058
+                tips_geom = eff_deck.labware_by_alias.get("tips")
+                cur_tip = tips_geom.default_tip_length_m() if tips_geom is not None else 0.05183
                 tip_len_by_take[cur_take] = cur_tip
             eff_tip = cur_tip
             if verb in {"eject", "detach", "discard_tip"}:
@@ -791,16 +1050,22 @@ def load_finebio_annotations(
 
 @dataclass(frozen=True)
 class TrajectorySafetyAudit:
-    """Unified physical safety audit report across `ArmSE3`, 96-well clearance, and meniscus slosh."""
+    """Unified physical safety audit report across published robot models, deck clearance, and slosh.
+
+    Note on Bond-number slosh regime (`#37`):
+    Flat-surface pure-gravity linear Bessel slosh requires `bond_number >= 5.0`
+    (`MIN_GRAVITY_SLOSH_BOND_NUMBER`). Standard 96-well (`Bo ~ 1.6`) and 384-well (`Bo ~ 0.44`)
+    aqueous wells are capillary-dominated and therefore set `slosh_model_status = "SLOSH_MODEL_OUT_OF_RANGE"`.
+    """
 
     source_id: str
-    safe: bool
+    safe: Optional[bool]
     n_frames: int
     duration_s: float
     se3_joint_limits_ok: bool
-    obstacle_clearance_ok: bool
+    obstacle_clearance_ok: Optional[bool]
     min_obstacle_clearance_mm: float
-    rim_clearance_ok: bool
+    rim_clearance_ok: Optional[bool]
     plunge_verticality_ok: bool
     max_plunge_tilt_deg: float
     slosh_safe: bool
@@ -811,6 +1076,14 @@ class TrajectorySafetyAudit:
     meniscus_to_headspace_ratio: float
     recommended_min_duration_s: float
     violations: Tuple[str, ...]
+    robot_type: Optional[str] = None
+    n_arm_joints: int = 6
+    flange_above_base_ok: bool = True
+    min_flange_z_m: float = 0.0
+    obstacle_check_status: str = "checked"
+    rim_check_status: str = "checked"
+    bond_number: float = 0.0
+    slosh_model_status: str = "SLOSH_MODEL_OUT_OF_RANGE"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -829,14 +1102,12 @@ def _integrate_cylindrical_meniscus_slosh_m(
     corner_offsets_xy: Sequence[Tuple[float, float]] = _DEFAULT_96_CORNER_OFFSETS_XY,
     include_corner_rotation: bool = False,
 ) -> Tuple[float, float]:
-    """Integrate fundamental cylindrical slosh mode (`xi_11 = 1.841`) + 120 ms ringdown via RK4."""
+    """Integrate fundamental cylindrical gravity-slosh mode + 120 ms ringdown via RK4."""
     acc = np.asarray(accel_xy_m_s2, dtype=np.float64)
     if acc.shape[0] == 0 or dt_s <= 1e-9:
         return 0.0, 0.0
 
-    omega_n = math.sqrt(_BESSEL_XI_11 * _GRAVITY_M_S2 / well_radius_m) * math.tanh(
-        _BESSEL_XI_11 * fill_height_m / well_radius_m
-    )
+    omega_n = slosh_natural_frequency(well_radius_m, fill_height_m)
 
     if (
         include_corner_rotation
@@ -996,14 +1267,24 @@ def _check_se3_tip_rim_and_plunge(
     return rim_ok, verticality_ok, max_plunge_tilt, effective_allowed
 
 
+def _transform_pose_to_deck(base_pose_in_deck: PoseSE3, robot_pose: PoseSE3) -> PoseSE3:
+    tf = base_pose_in_deck.homogeneous_matrix() @ robot_pose.homogeneous_matrix()
+    return PoseSE3(
+        xyz=(float(tf[0, 3]), float(tf[1, 3]), float(tf[2, 3])),
+        rpy=_rot_to_rpy(tf[:3, :3]),
+    )
+
+
 def audit_se3_trajectory(
     q6_trajectory: Sequence[Sequence[float]] | np.ndarray,
     timestamps_s: Sequence[float] | np.ndarray,
     *,
     source_id: str = "se3_trajectory",
-    arm_se3: ArmSE3 = DEFAULT_ARM_SE3,
+    arm_se3: ArmSE3 | UR5eRobotModel | FrankaRobotModel = DEFAULT_ARM_SE3,
     arm_2d: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
+    base_pose_in_deck: Optional[PoseSE3] = None,
+    check_deck_geometry: bool = True,
     attached_tip_length_m: Optional[float] = None,
     allowed_wells_xy: Optional[Sequence[Sequence[float] | np.ndarray]] = None,
     well_radius_m: float = 0.00345,
@@ -1013,91 +1294,127 @@ def audit_se3_trajectory(
     headspace_safety_fraction: float = 0.70,
     carrying_open_plate: bool = False,
 ) -> TrajectorySafetyAudit:
-    """Audit a 6-DOF `ArmSE3` joint trajectory for limits, `>= 5 mm` clearance, 96-well rims, and slosh."""
-    q6_arr = np.asarray(q6_trajectory, dtype=np.float64)
+    """Audit a 6-DoF or 7-DoF robot trajectory for joint limits, optional deck clearance/rims, and slosh."""
+    q_arr = np.asarray(q6_trajectory, dtype=np.float64)
     t_arr = np.asarray(timestamps_s, dtype=np.float64)
-    if q6_arr.ndim != 2 or q6_arr.shape[1] != 6 or q6_arr.shape[0] < 1:
-        raise ValueError(f"q6_trajectory must have shape (T, 6) with T >= 1, got {q6_arr.shape}")
-    if t_arr.shape != (q6_arr.shape[0],):
-        raise ValueError(f"timestamps_s shape {t_arr.shape} must match T={q6_arr.shape[0]}")
+    expected_dof = int(getattr(arm_se3, "n_joints", 6))
+    if q_arr.ndim != 2 or q_arr.shape[1] != expected_dof or q_arr.shape[0] < 1:
+        raise ValueError(
+            f"q_trajectory must have shape (T, {expected_dof}) with T >= 1, got {q_arr.shape}"
+        )
+    if t_arr.shape != (q_arr.shape[0],):
+        raise ValueError(f"timestamps_s shape {t_arr.shape} must match T={q_arr.shape[0]}")
 
     h_free_m = float(well_depth_m - fill_height_m)
     if h_free_m <= 0.0:
         raise ValueError("96-well slosh specification has non-positive free headspace")
 
+    bo_val = round(slosh_bond_number(well_radius_m), 4)
+    slosh_model_status = (
+        "IN_GRAVITY_REGIME" if bo_val >= MIN_GRAVITY_SLOSH_BOND_NUMBER else "SLOSH_MODEL_OUT_OF_RANGE"
+    )
+
     eff_tip_len = (
         float(scene.attached_tip_length_m) if attached_tip_length_m is None else float(attached_tip_length_m)
     )
-    eff_scene = scene if abs(eff_tip_len - scene.attached_tip_length_m) <= 1e-12 else scene.with_attached_tip(eff_tip_len)
+    eff_scene = (
+        scene
+        if abs(eff_tip_len - scene.attached_tip_length_m) <= 1e-12
+        else scene.with_attached_tip(eff_tip_len)
+    )
 
-    n_frames = int(q6_arr.shape[0])
+    n_frames = int(q_arr.shape[0])
     duration_s = float(t_arr[-1] - t_arr[0]) if n_frames >= 2 else 0.0
 
-    se3_limits_ok = all(arm_se3.within_joint_limits(q6_arr[i]) for i in range(n_frames))
-    poses: List[PoseSE3] = [arm_se3.fk_se3(q6_arr[i]) for i in range(n_frames)]
+    se3_limits_ok = all(arm_se3.within_joint_limits(q_arr[i]) for i in range(n_frames))
+    robot_poses: List[PoseSE3] = [arm_se3.fk_se3(q_arr[i]) for i in range(n_frames)]
+    flange_zs = [float(p.xyz[2]) for p in robot_poses]
+    min_flange_z = float(min(flange_zs))
+    flange_above_base_ok = bool(min_flange_z > 0.0)
+
+    poses: List[PoseSE3] = (
+        [_transform_pose_to_deck(base_pose_in_deck, p) for p in robot_poses]
+        if base_pose_in_deck is not None
+        else robot_poses
+    )
     tip_xyz = np.stack([p.tip_position(attached_tip_length_m=eff_tip_len) for p in poses], axis=0)
     tip_xy = tip_xyz[:, :2]
 
-    # Project SE(3) Cartesian tip path onto continuity-consistent planar 2-link chain for benchtop AABB check
-    q2_path: List[np.ndarray] = []
-    planar_reachable = True
-    prev_q2: Optional[np.ndarray] = None
-    for xy in tip_xy:
-        q2_cand: Optional[np.ndarray] = None
-        for elbow in (1, -1):
-            sol = arm_2d.ik(xy, elbow=elbow)
-            if sol is not None:
-                if prev_q2 is None or q2_cand is None:
-                    q2_cand = sol
-                elif float(np.linalg.norm(sol - prev_q2)) < float(np.linalg.norm(q2_cand - prev_q2)):
-                    q2_cand = sol
-        if q2_cand is None:
-            planar_reachable = False
-            break
-        q2_path.append(q2_cand)
-        prev_q2 = q2_cand
-
-    if planar_reachable and q2_path:
-        if len(q2_path) == 1:
-            min_clear_mm = 1000.0 * min_clearance(q2_path[0], arm=arm_2d, scene=eff_scene)
-        else:
-            min_clear_mm = 1000.0 * path_min_clearance(q2_path, arm=arm_2d, scene=eff_scene)
-        obstacle_ok = min_clear_mm >= (_MIN_OBSTACLE_CLEARANCE_MM - 1e-6)
-    else:
-        min_clear_mm = 0.0
-        obstacle_ok = False
-
-    allowed_arrs = None if allowed_wells_xy is None else [np.asarray(w, dtype=np.float64) for w in allowed_wells_xy]
-    rim_ok, verticality_ok, max_plunge_tilt, resolved_allowed = _check_se3_tip_rim_and_plunge(
-        poses,
-        scene=eff_scene,
-        attached_tip_length_m=eff_tip_len,
-        allowed_wells_xy=allowed_arrs,
-        max_plunge_tilt_rad=arm_se3.max_plunge_tilt_rad,
-    )
-
-    # Also verify dense segments do not tunnel across rims between waypoints
-    if rim_ok and planar_reachable and n_frames >= 2:
-        for i in range(n_frames - 1):
-            dist_xy = float(np.linalg.norm(tip_xy[i + 1] - tip_xy[i]))
-            dist_z = abs(float(poses[i + 1].xyz[2] - poses[i].xyz[2]))
-            n_sub = max(2, int(math.ceil(max(dist_xy / 0.004, dist_z / 0.004))) + 1)
-            if n_sub > 2:
-                for alpha in np.linspace(0.0, 1.0, n_sub)[1:-1]:
-                    q2_interp = (1.0 - float(alpha)) * q2_path[i] + float(alpha) * q2_path[i + 1]
-                    z_flange_interp = (1.0 - float(alpha)) * float(poses[i].xyz[2]) + float(alpha) * float(
-                        poses[i + 1].xyz[2]
-                    )
-                    if in_collision_3d(
-                        [float(q2_interp[0]), float(q2_interp[1]), z_flange_interp],
-                        arm=arm_2d,
-                        scene=eff_scene,
-                        allowed_wells_xy=resolved_allowed,
-                    ):
-                        rim_ok = False
-                        break
-            if not rim_ok:
+    obstacle_ok_opt: Optional[bool]
+    rim_ok_opt: Optional[bool]
+    if check_deck_geometry:
+        obstacle_check_status = "checked"
+        rim_check_status = "checked"
+        # Project SE(3) Cartesian tip path onto continuity-consistent planar 2-link chain for benchtop AABB check
+        q2_path: List[np.ndarray] = []
+        planar_reachable = True
+        prev_q2: Optional[np.ndarray] = None
+        for xy in tip_xy:
+            q2_cand: Optional[np.ndarray] = None
+            for elbow in (1, -1):
+                sol = arm_2d.ik(xy, elbow=elbow)
+                if sol is not None:
+                    if prev_q2 is None or q2_cand is None:
+                        q2_cand = sol
+                    elif float(np.linalg.norm(sol - prev_q2)) < float(np.linalg.norm(q2_cand - prev_q2)):
+                        q2_cand = sol
+            if q2_cand is None:
+                planar_reachable = False
                 break
+            q2_path.append(q2_cand)
+            prev_q2 = q2_cand
+
+        if planar_reachable and q2_path:
+            if len(q2_path) == 1:
+                min_clear_mm = 1000.0 * min_clearance(q2_path[0], arm=arm_2d, scene=eff_scene)
+            else:
+                min_clear_mm = 1000.0 * path_min_clearance(q2_path, arm=arm_2d, scene=eff_scene)
+            obstacle_ok_opt = bool(min_clear_mm >= (_MIN_OBSTACLE_CLEARANCE_MM - 1e-6))
+        else:
+            min_clear_mm = 0.0
+            obstacle_ok_opt = False
+
+        allowed_arrs = None if allowed_wells_xy is None else [np.asarray(w, dtype=np.float64) for w in allowed_wells_xy]
+        rim_ok, verticality_ok, max_plunge_tilt, resolved_allowed = _check_se3_tip_rim_and_plunge(
+            poses,
+            scene=eff_scene,
+            attached_tip_length_m=eff_tip_len,
+            allowed_wells_xy=allowed_arrs,
+            max_plunge_tilt_rad=arm_se3.max_plunge_tilt_rad,
+        )
+
+        # Also verify dense segments do not tunnel across rims between waypoints
+        if rim_ok and planar_reachable and n_frames >= 2:
+            for i in range(n_frames - 1):
+                dist_xy = float(np.linalg.norm(tip_xy[i + 1] - tip_xy[i]))
+                dist_z = abs(float(poses[i + 1].xyz[2] - poses[i].xyz[2]))
+                n_sub = max(2, int(math.ceil(max(dist_xy / 0.004, dist_z / 0.004))) + 1)
+                if n_sub > 2:
+                    for alpha in np.linspace(0.0, 1.0, n_sub)[1:-1]:
+                        q2_interp = (1.0 - float(alpha)) * q2_path[i] + float(alpha) * q2_path[i + 1]
+                        z_flange_interp = (1.0 - float(alpha)) * float(poses[i].xyz[2]) + float(alpha) * float(
+                            poses[i + 1].xyz[2]
+                        )
+                        if in_collision_3d(
+                            [float(q2_interp[0]), float(q2_interp[1]), z_flange_interp],
+                            arm=arm_2d,
+                            scene=eff_scene,
+                            allowed_wells_xy=resolved_allowed,
+                        ):
+                            rim_ok = False
+                            break
+                if not rim_ok:
+                    break
+        rim_ok_opt = bool(rim_ok)
+    else:
+        # Robot-frame-only audit when deck layout / base_pose_in_deck is unknown (#36)
+        obstacle_check_status = "not_checked"
+        rim_check_status = "not_checked"
+        obstacle_ok_opt = None
+        rim_ok_opt = None
+        min_clear_mm = 0.0
+        verticality_ok = True
+        max_plunge_tilt = 0.0
 
     if n_frames >= 3 and duration_s > 1e-6:
         t_uniform = np.linspace(float(t_arr[0]), float(t_arr[-1]), max(n_frames, 81), dtype=np.float64)
@@ -1143,9 +1460,9 @@ def audit_se3_trajectory(
     violations: List[str] = []
     if not se3_limits_ok:
         violations.append("SE3_JOINT_LIMIT_EXCEEDED")
-    if not obstacle_ok:
+    if obstacle_ok_opt is False:
         violations.append("OBSTACLE_CLEARANCE_BELOW_5MM")
-    if not rim_ok:
+    if rim_ok_opt is False:
         violations.append("WELL_RIM_COLLISION")
     if not verticality_ok:
         violations.append("PLUNGE_TILT_EXCEEDED")
@@ -1158,9 +1475,9 @@ def audit_se3_trajectory(
         n_frames=n_frames,
         duration_s=round(duration_s, 4),
         se3_joint_limits_ok=bool(se3_limits_ok),
-        obstacle_clearance_ok=bool(obstacle_ok),
+        obstacle_clearance_ok=obstacle_ok_opt,
         min_obstacle_clearance_mm=round(float(min_clear_mm), 4),
-        rim_clearance_ok=bool(rim_ok),
+        rim_clearance_ok=rim_ok_opt,
         plunge_verticality_ok=bool(verticality_ok),
         max_plunge_tilt_deg=round(math.degrees(max_plunge_tilt), 4),
         slosh_safe=bool(slosh_ok),
@@ -1171,28 +1488,90 @@ def audit_se3_trajectory(
         meniscus_to_headspace_ratio=round(float(ratio), 4),
         recommended_min_duration_s=round(float(rec_min_dur), 4),
         violations=tuple(violations),
+        robot_type=getattr(arm_se3, "robot_type", None),
+        n_arm_joints=expected_dof,
+        flange_above_base_ok=flange_above_base_ok,
+        min_flange_z_m=round(min_flange_z, 6),
+        obstacle_check_status=obstacle_check_status,
+        rim_check_status=rim_check_status,
+        bond_number=bo_val,
+        slosh_model_status=slosh_model_status,
     )
 
 
 def audit_lerobot_episode(
     episode: LeRobotEpisode,
     *,
-    arm_se3: ArmSE3 = DEFAULT_ARM_SE3,
+    arm_se3: Optional[ArmSE3 | UR5eRobotModel | FrankaRobotModel] = None,
     arm_2d: Arm2D = DEFAULT_ARM,
     scene: BenchScene = DEFAULT_SCENE,
+    base_pose_in_deck: Optional[PoseSE3] = None,
     attached_tip_length_m: float = 0.0,
     allowed_wells_xy: Optional[Sequence[Sequence[float] | np.ndarray]] = None,
     carrying_open_plate: bool = False,
     headspace_safety_fraction: float = 0.70,
 ) -> TrajectorySafetyAudit:
-    """Run `ArmSE3`, 96-well rim, `>= 5 mm` obstacle, and meniscus slosh checks on a `LeRobotEpisode`."""
+    """Audit a `LeRobotEpisode` using its recording robot's kinematics (`ur5e`, `franka`, or `arm_se3`).
+
+    - Selects the kinematic model from `episode.robot_type` unless `arm_se3` is explicitly passed.
+    - When `robot_type` is unknown, returns `safe=None` with `violations=("ROBOT_MODEL_UNKNOWN",)`.
+    - Without `base_pose_in_deck`, runs robot-frame checks only (joint limits, flange Z, slosh) and
+      reports `obstacle_check_status="not_checked"` and `rim_check_status="not_checked"`.
+    """
+    src_id = f"{episode.dataset_id}:ep{episode.episode_index:04d}"
+    resolved_model = arm_se3 if arm_se3 is not None else get_robot_model_se3(episode.robot_type)
+    bo_val = round(slosh_bond_number(0.00345), 4)
+    slosh_status = (
+        "IN_GRAVITY_REGIME" if bo_val >= MIN_GRAVITY_SLOSH_BOND_NUMBER else "SLOSH_MODEL_OUT_OF_RANGE"
+    )
+    if resolved_model is None:
+        return TrajectorySafetyAudit(
+            source_id=src_id,
+            safe=None,
+            n_frames=episode.n_frames,
+            duration_s=round(episode.duration_s, 4),
+            se3_joint_limits_ok=False,
+            obstacle_clearance_ok=None,
+            min_obstacle_clearance_mm=0.0,
+            rim_clearance_ok=None,
+            plunge_verticality_ok=False,
+            max_plunge_tilt_deg=0.0,
+            slosh_safe=False,
+            spilled=False,
+            peak_lateral_accel_m_s2=0.0,
+            peak_meniscus_rise_mm=0.0,
+            free_headspace_mm=1.47,
+            meniscus_to_headspace_ratio=0.0,
+            recommended_min_duration_s=0.0,
+            violations=("ROBOT_MODEL_UNKNOWN",),
+            robot_type=episode.robot_type,
+            n_arm_joints=episode.n_arm_joints,
+            flange_above_base_ok=False,
+            min_flange_z_m=0.0,
+            obstacle_check_status="not_checked",
+            rim_check_status="not_checked",
+            bond_number=bo_val,
+            slosh_model_status=slosh_status,
+        )
+
+    arm_q = episode.arm_joints
+    if arm_q.shape[1] != resolved_model.n_joints:
+        if episode.joint_positions_rad.shape[1] >= resolved_model.n_joints:
+            arm_q = episode.joint_positions_rad[:, : resolved_model.n_joints]
+        else:
+            raise ValueError(
+                f"Episode has {arm_q.shape[1]} arm joints, but {resolved_model.robot_type} requires {resolved_model.n_joints}"
+            )
+
     return audit_se3_trajectory(
-        episode.q6_se3,
+        arm_q,
         episode.timestamps_s,
-        source_id=f"{episode.dataset_id}:ep{episode.episode_index:04d}",
-        arm_se3=arm_se3,
+        source_id=src_id,
+        arm_se3=resolved_model,
         arm_2d=arm_2d,
         scene=scene,
+        base_pose_in_deck=base_pose_in_deck,
+        check_deck_geometry=(base_pose_in_deck is not None),
         attached_tip_length_m=attached_tip_length_m,
         allowed_wells_xy=allowed_wells_xy,
         carrying_open_plate=carrying_open_plate,
